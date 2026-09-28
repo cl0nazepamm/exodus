@@ -643,6 +643,154 @@ void rebuild_mesh(InMesh& m, const FaceSet& fs, const Level& R) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// Mirror symmetry. A character's topology is usually symmetric even where its shape is not quite
+// (morphs, sculpting), so the mirror is found on the topology: a face is matched to its mirror
+// image by position, and the match is walked across the mesh face by face with the winding
+// reversed. Every part not reached from an earlier seed (eyes, lashes) gets a seed of its own.
+// Positions only pick the seed and confirm the walk (most of its vertices must land within half an
+// edge of their mirror image); after that the topology decides, so a posed or sculpted side still
+// pairs up. A vertex reached with two different images has none. The three axes are tried through
+// the mean vertex; the one that pairs the most vertices wins. Returns the mirror of every position
+// (itself on the plane, kNone where there is none).
+std::vector<uint32_t> find_mirror(const InMesh& m, int& axisOut) {
+    const FaceSet fs = faces_of(m);
+    const Topo t = topo_for(fs, m.cornerPos, m.positions.size());
+    const uint32_t nf = t.nf(), nv = t.nv;
+    const std::vector<Vec3d>& P = m.positions;
+    auto dist = [](const Vec3d& a, const Vec3d& b) {
+        return std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));
+    };
+    axisOut = -1;
+    std::vector<uint32_t> best(nv, kNone);
+    if (!nf || !t.ne()) return best;
+
+    // local edge length per vertex and face, face centres, and a grid over the centres
+    std::vector<double> vlen(nv, 0.0), flen(nf, 0.0);
+    std::vector<uint32_t> vcnt(nv, 0);
+    double lenSum = 0;
+    for (uint32_t e = 0; e < t.ne(); ++e) {
+        const double l = dist(P[t.edgeA[e]], P[t.edgeB[e]]);
+        vlen[t.edgeA[e]] += l;
+        vlen[t.edgeB[e]] += l;
+        ++vcnt[t.edgeA[e]];
+        ++vcnt[t.edgeB[e]];
+        lenSum += l;
+    }
+    for (uint32_t v = 0; v < nv; ++v)
+        if (vcnt[v]) vlen[v] /= vcnt[v];
+    std::vector<Vec3d> cen(nf, Vec3d{0, 0, 0});
+    for (uint32_t f = 0; f < nf; ++f)
+        for (uint32_t c = t.faceFirst[f]; c < t.faceFirst[f + 1]; ++c) {
+            for (int d = 0; d < 3; ++d) cen[f][d] += P[t.idx[c]][d] / t.deg(f);
+            flen[f] += vlen[t.idx[c]] / t.deg(f);
+        }
+    const double cell = std::max(2 * lenSum / t.ne(), 1e-12);
+    auto key = [&](const Vec3d& p, int dx, int dy, int dz) {
+        const int64_t x = (int64_t)std::floor(p[0] / cell) + dx, y = (int64_t)std::floor(p[1] / cell) + dy,
+                      z = (int64_t)std::floor(p[2] / cell) + dz;
+        return (uint64_t)(x & 0x1FFFFF) << 42 | (uint64_t)(y & 0x1FFFFF) << 21 | (uint64_t)(z & 0x1FFFFF);
+    };
+    std::vector<std::pair<uint64_t, uint32_t>> grid(nf);
+    for (uint32_t f = 0; f < nf; ++f) grid[f] = {key(cen[f], 0, 0, 0), f};
+    std::sort(grid.begin(), grid.end());
+
+    // the corner that starts the same edge the other way round in the face across, or kNone
+    auto across = [&](uint32_t c) {
+        const uint32_t e = t.cornerEdge[c];
+        if (t.edgeFaces(e) != 2) return kNone;
+        for (uint32_t k = t.edgeFirst[e]; k < t.edgeFirst[e + 1]; ++k) {
+            const uint32_t c2 = t.edgeCorners[k];
+            if (t.faceOf[c2] != t.faceOf[c] && t.idx[c2] == t.idx[t.next(c)]) return c2;
+        }
+        return kNone;
+    };
+
+    size_t bestCount = 0;
+    std::vector<uint32_t> fimg(nf), vimg(nv), queue, comp, touched, clashed, res(nv);
+    std::vector<uint8_t> tried(nf), bad(nv);
+    for (int axis = 0; axis < 3; ++axis) {
+        double plane = 0;
+        size_t used = 0;
+        for (uint32_t v = 0; v < nv; ++v)
+            if (vcnt[v]) { plane += P[v][axis]; ++used; }
+        plane /= (double)std::max<size_t>(used, 1);
+        auto mirror = [&](Vec3d p) { p[axis] = 2 * plane - p[axis]; return p; };
+        std::fill(fimg.begin(), fimg.end(), kNone);
+        std::fill(vimg.begin(), vimg.end(), kNone);
+        std::fill(tried.begin(), tried.end(), 0);
+        std::fill(bad.begin(), bad.end(), 0);
+        for (uint32_t f = 0; f < nf; ++f) {
+            if (fimg[f] != kNone || tried[f]) continue;
+            tried[f] = 1;
+            // seed: the face and corner that match the mirror image of f best, within half an edge
+            const Vec3d mc = mirror(cen[f]);
+            const uint32_t n0 = t.deg(f);
+            double bestErr = 0.5 * flen[f];
+            uint32_t seed = kNone;
+            for (int dx = -1; dx <= 1; ++dx)
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        const uint64_t k = key(mc, dx, dy, dz);
+                        auto it = std::lower_bound(grid.begin(), grid.end(), std::pair<uint64_t, uint32_t>{k, 0});
+                        for (; it != grid.end() && it->first == k; ++it) {
+                            const uint32_t g = it->second;
+                            if (t.deg(g) != n0) continue;
+                            for (uint32_t j = 0; j < n0; ++j) {
+                                double err = 0;
+                                for (uint32_t i = 0; i < n0 && err < bestErr; ++i)
+                                    err = std::max(err, dist(mirror(P[t.idx[t.faceFirst[f] + i]]), P[t.idx[t.faceFirst[g] + (j + n0 - i) % n0]]));
+                                if (err < bestErr) { bestErr = err; seed = t.faceFirst[g] + j; }
+                            }
+                        }
+                    }
+            if (seed == kNone) continue;
+            // walk: corner c of a face maps to corner d of its image, next(c) to prev(d)
+            comp.assign(1, f);
+            touched.clear();
+            clashed.clear();
+            fimg[f] = t.faceOf[seed];
+            queue.assign({t.faceFirst[f], seed});
+            for (size_t qi = 0; qi < queue.size(); qi += 2) {
+                uint32_t c = queue[qi], d = queue[qi + 1];
+                const uint32_t n = t.deg(t.faceOf[c]);
+                for (uint32_t k = 0; k < n; ++k, c = t.next(c), d = t.prev(d)) {
+                    const uint32_t a = t.idx[c], b = t.idx[d];
+                    if (vimg[a] == kNone) { vimg[a] = b; touched.push_back(a); }
+                    else if (vimg[a] != b && !bad[a]) { bad[a] = 1; clashed.push_back(a); }
+                    const uint32_t c2 = across(c), d2 = across(t.prev(d));
+                    if (c2 == kNone || d2 == kNone) continue;
+                    const uint32_t f2 = t.faceOf[c2], g2 = t.faceOf[d2];
+                    if (fimg[f2] != kNone || t.deg(f2) != t.deg(g2)) continue;
+                    fimg[f2] = g2;
+                    comp.push_back(f2);
+                    queue.push_back(c2);
+                    queue.push_back(t.next(d2));
+                }
+            }
+            size_t near = 0;
+            for (uint32_t a : touched) near += dist(mirror(P[a]), P[vimg[a]]) <= 0.5 * vlen[a];
+            if (2 * near < touched.size()) {  // a wrong seed: undo the walk
+                for (uint32_t g : comp) { fimg[g] = kNone; tried[g] = 1; }
+                for (uint32_t a : touched) vimg[a] = kNone;
+                for (uint32_t a : clashed) bad[a] = 0;
+            }
+        }
+        size_t count = 0;
+        for (uint32_t v = 0; v < nv; ++v) {
+            const uint32_t w = vimg[v];
+            res[v] = w != kNone && !bad[v] && !bad[w] && vimg[w] == v ? w : kNone;
+            count += res[v] != kNone;
+        }
+        if (count > bestCount) {
+            bestCount = count;
+            best = res;
+            axisOut = axis;
+        }
+    }
+    return best;
+}
+
+// ------------------------------------------------------------------------------------------------
 // Approximate reverse subdivision for meshes that are not a subdivision result: Blender's
 // un-subdivide (source/blender/bmesh/tools/bmesh_decimate_unsubdivide.cc), extended for per-corner
 // data. A flood fill over edges colours the vertices like a checkerboard and every other one is
@@ -658,17 +806,26 @@ void rebuild_mesh(InMesh& m, const FaceSet& fs, const Level& R) {
 // Blender dissolves a vertex on the mesh border as the fan of its one side. A UV seam, hard normal
 // edge or material border through a vertex is treated the same way here: each side is dissolved on
 // its own, so the seam stays an edge and is halved like everything else.
+//
+// With `symmetric`, a mesh with a mirror (see find_mirror) stays symmetric: the fill colours a
+// vertex and its mirror image alike, a vertex is dissolved only together with its image (the
+// first is undone when the second cannot follow), and triangle pairs join only with their image.
 
 struct DissolveResult {
     size_t passes = 0, dissolved = 0, joined = 0;
-    std::string stop;  // why a pass found nothing to dissolve (empty = both passes did work)
+    std::string stop;     // why a pass found nothing to dissolve (empty = both passes did work)
+    int axis = -1;        // mirror axis (-1 = none)
+    double mirrored = 0;  // share of the vertices with a mirror image
+    size_t unpaired = 0;  // dissolves and joins left out because the mirror side could not follow
 };
 
-DissolveResult dissolve_level(InMesh& m, const std::vector<uint8_t>& lockedMaterial) {
+DissolveResult dissolve_level(InMesh& m, const std::vector<uint8_t>& lockedMaterial, bool symmetric) {
     struct Corner { uint32_t pos, uv, nrm; };
     struct Face { std::vector<Corner> c; uint32_t material = 0; bool dead = false; };
     const bool hasN = !m.cornerNrm.empty();
     const uint32_t nv = (uint32_t)m.positions.size();
+    DissolveResult res;
+    const std::vector<uint32_t> mir = symmetric ? find_mirror(m, res.axis) : std::vector<uint32_t>(nv, kNone);
     std::vector<Face> faces(m.faces.size());
     std::vector<std::vector<uint32_t>> vertFaces(nv);  // live faces per position
     for (uint32_t f = 0; f < m.faces.size(); ++f) {
@@ -834,8 +991,27 @@ DissolveResult dissolve_level(InMesh& m, const std::vector<uint8_t>& lockedMater
         return true;
     };
 
-    // Dissolve `v` as planned: the ring faces give up their corner at v, the polygons join in.
-    auto dissolve = [&](uint32_t v) {
+    // Dissolve `v` as planned: the ring faces give up their corner at v, the polygons join in. With
+    // `u`, what it changes is saved first so `restore` can put it back.
+    struct Undo {
+        size_t faceCount = 0;
+        std::vector<std::pair<uint32_t, Face>> faces;
+        std::vector<std::pair<uint32_t, std::vector<uint32_t>>> vertFaces;
+    } undo;
+    auto dissolve = [&](uint32_t v, Undo* u) {
+        if (u) {
+            u->faceCount = faces.size();
+            u->faces.clear();
+            u->vertFaces.clear();
+            for (const Wedge& w : ring) {
+                u->faces.push_back({w.face, faces[w.face]});
+                for (const Corner& c : faces[w.face].c) {
+                    bool saved = false;
+                    for (const auto& [x, list] : u->vertFaces) saved |= x == c.pos;
+                    if (!saved) u->vertFaces.push_back({c.pos, vertFaces[c.pos]});
+                }
+            }
+        }
         for (const Wedge& w : ring) {
             Face& F = faces[w.face];
             if (F.c.size() > 3) {
@@ -855,6 +1031,11 @@ DissolveResult dissolve_level(InMesh& m, const std::vector<uint8_t>& lockedMater
             faces.push_back({std::move(polys[i]), polyMat[i]});
             for (const Corner& c : faces[id].c) vertFaces[c.pos].push_back(id);
         }
+    };
+    auto restore = [&](Undo& u) {
+        for (auto& [f, F] : u.faces) faces[f] = std::move(F);
+        faces.resize(u.faceCount);
+        for (auto& [v, list] : u.vertFaces) vertFaces[v] = std::move(list);
     };
 
     // Two passes of Blender's fill: a flood fill over the vertices that can go colours them in
@@ -879,7 +1060,23 @@ DissolveResult dissolve_level(InMesh& m, const std::vector<uint8_t>& lockedMater
         std::sort(nb.begin(), nb.end());
         nb.erase(std::unique(nb.begin(), nb.end()), nb.end());
     };
-    DissolveResult res;
+    {
+        size_t used = 0, paired = 0;
+        for (uint32_t v = 0; v < nv; ++v) {
+            used += !vertFaces[v].empty();
+            paired += !vertFaces[v].empty() && mir[v] != kNone;
+        }
+        res.mirrored = used ? (double)paired / (double)used : 0.0;
+    }
+    // a vertex and its mirror image get the same region and colour
+    auto assign = [&](uint32_t u, uint32_t r, uint8_t par) {
+        for (uint32_t x : {u, mir[u]}) {
+            if (x == kNone || !can[x] || region[x] != kNone) continue;
+            region[x] = r;
+            parity[x] = par;
+            queue.push_back(x);
+        }
+    };
     for (int pass = 0; pass < 2; ++pass) {
         for (uint32_t v = 0; v < nv; ++v) {
             can[v] = plan(v, false);
@@ -890,9 +1087,8 @@ DissolveResult dissolve_level(InMesh& m, const std::vector<uint8_t>& lockedMater
             if (!can[s] || region[s] != kNone) continue;
             const uint32_t r = (uint32_t)votes.size();
             votes.push_back({0, 0});
-            region[s] = r;
-            parity[s] = 0;
-            queue.assign(1, s);
+            queue.clear();
+            assign(s, r, 0);
             for (size_t qi = 0; qi < queue.size(); ++qi) {
                 const uint32_t v = queue[qi];
                 neighbours(v);
@@ -900,9 +1096,7 @@ DissolveResult dissolve_level(InMesh& m, const std::vector<uint8_t>& lockedMater
                     if (!can[u]) {
                         if (!vertFaces[u].empty()) ++votes[r][parity[v]];  // u stays if v goes
                     } else if (region[u] == kNone) {
-                        region[u] = r;
-                        parity[u] = parity[v] ^ 1;
-                        queue.push_back(u);
+                        assign(u, r, parity[v] ^ 1);
                     }
                 }
             }
@@ -914,17 +1108,37 @@ DissolveResult dissolve_level(InMesh& m, const std::vector<uint8_t>& lockedMater
             const std::array<size_t, 2>& vt = votes[region[v]];
             const uint8_t go = vt[0] > vt[1] ? 0 : 1;  // a tie: Blender's choice
             marked[v] = parity[v] == go;
+            const uint32_t w = mir[v];  // both sides go or neither, and never a vertex next to its own image
+            if (marked[v] && w != kNone && w != v) {
+                neighbours(v);
+                marked[v] = can[w] && parity[w] == parity[v] && !std::binary_search(nb.begin(), nb.end(), w);
+            }
             any |= marked[v] != 0;
         }
         if (!any) {
             res.stop = "no vertex can be dissolved";
             break;
         }
-        for (uint32_t v = 0; v < nv; ++v)
-            if (marked[v] && plan(v, true)) {
-                dissolve(v);
-                ++res.dissolved;
+        for (uint32_t v = 0; v < nv; ++v) {
+            if (!marked[v]) continue;
+            const uint32_t w = mir[v];
+            if (w == kNone || w == v) {
+                if (plan(v, true)) {
+                    dissolve(v, nullptr);
+                    ++res.dissolved;
+                }
+                continue;
             }
+            if (w < v || !plan(v, true)) continue;  // a pair goes when its first vertex comes up
+            dissolve(v, &undo);
+            if (plan(w, true)) {
+                dissolve(w, nullptr);
+                res.dissolved += 2;
+            } else {
+                restore(undo);
+                ++res.unpaired;
+            }
+        }
         ++res.passes;
     }
 
@@ -992,19 +1206,52 @@ DissolveResult dissolve_level(InMesh& m, const std::vector<uint8_t>& lockedMater
         }
     }
     std::sort(joins.begin(), joins.end(), [](const Join& x, const Join& y) { return x.error < y.error; });
-    for (const Join& J : joins) {
-        Face& T = faces[J.t];
-        Face& G = faces[J.g];
-        if (T.dead || G.dead || T.c.size() != 3 || G.c.size() != 3) continue;  // one of them already joined
-        const Corner a = T.c[J.at], b = T.c[(J.at + 1) % 3], c = T.c[(J.at + 2) % 3], d = G.c[(J.gt + 2) % 3];
+    auto triangle = [&](uint32_t f) { return f != kNone && !faces[f].dead && faces[f].c.size() == 3; };
+    auto corner_of = [&](uint32_t f, uint32_t v) {  // the corner of v in face f, or kNone
+        for (uint32_t k = 0; k < faces[f].c.size(); ++k)
+            if (faces[f].c[k].pos == v) return k;
+        return kNone;
+    };
+    auto mirror_tri = [&](uint32_t f) {  // the live triangle on the mirror images of f's corners
+        uint32_t mv[3];
+        for (int k = 0; k < 3; ++k)
+            if ((mv[k] = mir[faces[f].c[k].pos]) == kNone) return kNone;
+        for (uint32_t h : vertFaces[mv[0]])
+            if (triangle(h) && corner_of(h, mv[1]) != kNone && corner_of(h, mv[2]) != kNone) return h;
+        return kNone;
+    };
+    auto join = [&](uint32_t t, uint32_t at, uint32_t g, uint32_t gt) {  // g runs t's edge at -> at + 1 backwards
+        Face& T = faces[t];
+        const Corner a = T.c[at], b = T.c[(at + 1) % 3], c = T.c[(at + 2) % 3], d = faces[g].c[(gt + 2) % 3];
         T.c = {a, d, b, c};
-        G.dead = true;
-        for (const Corner& x : G.c) {
+        faces[g].dead = true;
+        for (const Corner& x : faces[g].c) {
             std::vector<uint32_t>& vf = vertFaces[x.pos];
-            vf.erase(std::find(vf.begin(), vf.end(), J.g));
+            vf.erase(std::find(vf.begin(), vf.end(), g));
         }
-        vertFaces[d.pos].push_back(J.t);
+        vertFaces[d.pos].push_back(t);
         ++res.joined;
+    };
+    for (const Join& J : joins) {
+        if (!triangle(J.t) || !triangle(J.g)) continue;  // one of them already joined
+        const uint32_t a = faces[J.t].c[J.at].pos, b = faces[J.t].c[(J.at + 1) % 3].pos;
+        bool alone = true;  // no mirror here: nothing to keep symmetric
+        for (const uint32_t f : {J.t, J.g})
+            for (const Corner& c : faces[f].c) alone &= mir[c.pos] == kNone;
+        const uint32_t mt = alone ? kNone : mirror_tri(J.t), mg = alone ? kNone : mirror_tri(J.g);
+        if (alone || (mt == J.t && mg == J.g) || (mt == J.g && mg == J.t)) {  // no mirror, or its own mirror
+            join(J.t, J.at, J.g, J.gt);
+            continue;
+        }
+        // the mirror pair runs the shared edge the other way: mt from mir[b] to mir[a], mg back
+        const uint32_t mat = mt == kNone ? kNone : corner_of(mt, mir[b]), mgt = mg == kNone ? kNone : corner_of(mg, mir[a]);
+        if (mat == kNone || mgt == kNone || mt == J.t || mt == J.g || mg == J.t || mg == J.g ||
+            faces[mt].c[(mat + 1) % 3].pos != mir[a] || faces[mg].c[(mgt + 1) % 3].pos != mir[b]) {
+            ++res.unpaired;
+            continue;
+        }
+        join(J.t, J.at, J.g, J.gt);
+        join(mt, mat, mg, mgt);
     }
 
     InMesh out;
@@ -1058,10 +1305,13 @@ SubdivReport unsubdivide_scene(InScene& scene, const UnsubdivideOptions& opt) {
             rep.materialMismatch += R.materialMismatch;
             if (R.cfFirst.size() == 1) {  // nothing reversed exactly at this level
                 if (opt.exactOnly || m.faces.empty()) break;
-                const DissolveResult d = dissolve_level(m, opt.keep);
+                const DissolveResult d = dissolve_level(m, opt.keep, opt.symmetry);
                 mr.dissolved += d.dissolved;
                 mr.passes += d.passes;
                 mr.joined += d.joined;
+                mr.unpaired += d.unpaired;
+                mr.mirrorAxis = d.axis;
+                mr.mirrored = d.mirrored;
                 mr.stop = d.stop;
                 if (d.passes) ++mr.approxLevels;
                 if (!d.stop.empty()) break;

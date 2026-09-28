@@ -57,6 +57,7 @@ struct Options {
     int unsubdivide = 0;    // Catmull-Clark levels to reverse
     bool cage = false;      // recover the control cage positions instead of keeping the smoothed ones
     bool unsubExact = false;  // refuse meshes that are not a subdivision result instead of coarsening them
+    bool noSymmetry = false;  // let coarsening break the symmetry of mirror-symmetric meshes
     int subdivide = 0;      // Catmull-Clark levels to apply (utility / round-trip testing)
 };
 
@@ -81,6 +82,7 @@ static void usage() {
         "                                other vertex is dissolved twice per level (Blender's un-subdivide);\n"
         "                                vertices keep their positions, UVs and normals (seams stay seams)\n"
         "  --unsubdivide-exact           refuse meshes that are not a subdivision result instead\n"
+        "  --no-symmetry                 with --unsubdivide: do not keep mirror-symmetric meshes symmetric\n"
         "  --cage                        with --unsubdivide: recover the control cage positions\n"
         "                                (least squares) instead of keeping the smoothed ones\n"
         "  --subdivide N                 apply N Catmull-Clark levels (positions, UVs, normals)\n"
@@ -148,6 +150,7 @@ static bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--unsubdivide") o.unsubdivide = std::stoi(next());
         else if (a == "--cage") o.cage = true;
         else if (a == "--unsubdivide-exact") o.unsubExact = true;
+        else if (a == "--no-symmetry") o.noSymmetry = true;
         else if (a == "--subdivide") o.subdivide = std::stoi(next());
         else if (a == "--tris") o.tris = std::stoull(next());
         else if (a == "--decimate") {
@@ -403,6 +406,7 @@ struct Packer {
             u.levels = o.unsubdivide;
             u.solveCage = o.cage;
             u.exactOnly = o.unsubExact;
+            u.symmetry = !o.noSymmetry;
             u.keep.assign(scene.materials.size(), 0);
             for (const std::string& g : o.noDecimate)
                 for (size_t i = 0; i < scene.materials.size(); ++i)
@@ -415,6 +419,9 @@ struct Packer {
                 if (m.approxLevels)
                     say(" %d approx (%zu vertices dissolved in %zu passes, %zu triangle pairs joined)", m.approxLevels,
                         m.dissolved, m.passes, m.joined);
+                if (m.approxLevels && m.mirrorAxis >= 0)
+                    say(" mirror %c on %.1f%% of the vertices (%zu left out to stay symmetric)", "xyz"[m.mirrorAxis],
+                        m.mirrored * 100, m.unpaired);
                 if (!m.levels && !m.approxLevels) say(" unchanged");
                 if (m.levels + m.approxLevels < o.unsubdivide) {
                     if (!m.stop.empty()) say("  ! stopped: %s", m.stop.c_str());

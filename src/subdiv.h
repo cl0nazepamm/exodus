@@ -23,6 +23,7 @@ struct UnsubdivideOptions {
     int levels = 1;
     bool solveCage = false;    // recover the control cage positions instead of keeping the smoothed ones
     bool exactOnly = false;    // refuse meshes that are not a subdivision result instead of coarsening them
+    bool symmetry = true;      // coarsening keeps a mirror-symmetric mesh symmetric (mirror found by itself)
     std::vector<uint8_t> keep; // per material: 1 = its faces and vertices are never touched by coarsening
 };
 
@@ -38,6 +39,9 @@ struct SubdivReport {
         int approxLevels = 0;              // levels approximated by checkerboard dissolve
         size_t dissolved = 0, passes = 0;  // vertices dissolved, dissolve passes
         size_t joined = 0;                 // triangle pairs joined into quads afterwards
+        size_t unpaired = 0;               // dissolves and joins left out to stay symmetric
+        int mirrorAxis = -1;               // mirror found at the last approximate level (-1 = none)
+        double mirrored = 0;               // share of its vertices with a mirror image
         size_t keptFaces = 0;           // faces left untouched at the last exact level (not a subdivision result)
         size_t keptSets = 0;            // face sets those faces belong to
         std::string reason;             // why the last attempted exact level did not (fully) reverse; empty = fine
