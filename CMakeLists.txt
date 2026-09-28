@@ -9,21 +9,32 @@ file(GLOB MESHOPT_SOURCES CONFIGURE_DEPENDS third_party/meshoptimizer/*.cpp)
 add_library(meshoptimizer STATIC ${MESHOPT_SOURCES})
 target_include_directories(meshoptimizer PUBLIC third_party/meshoptimizer)
 
-add_executable(udimpacker
-    src/main.cpp
-    src/fbx_input.cpp
+# The DCC-neutral core, shared by the command-line tool and the 3ds Max plugin.
+add_library(udimpacker_core STATIC
     src/image.cpp
     src/pack.cpp
     src/bleed.cpp
     src/decimate.cpp
     src/subdiv.cpp
-    third_party/ufbx.c
     third_party/lodepng.cpp)
+target_include_directories(udimpacker_core PUBLIC src third_party)
+target_link_libraries(udimpacker_core PUBLIC meshoptimizer)
 
-target_include_directories(udimpacker PRIVATE src third_party)
-target_link_libraries(udimpacker PRIVATE meshoptimizer)
+add_executable(udimpacker
+    src/main.cpp
+    src/fbx_input.cpp
+    third_party/ufbx.c)
+target_link_libraries(udimpacker PRIVATE udimpacker_core)
 
 if(MSVC)
-    target_compile_options(udimpacker PRIVATE /utf-8 /W3)
-    target_compile_definitions(udimpacker PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    foreach(target udimpacker_core udimpacker)
+        target_compile_options(${target} PRIVATE /utf-8 /W3)
+        target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    endforeach()
+endif()
+
+# 3ds Max 2027 plugin (max/): skipped with a warning when the SDK is not installed.
+option(UDIM_MAX "Build the 3ds Max 2027 plugin" ON)
+if(UDIM_MAX)
+    add_subdirectory(max)
 endif()
