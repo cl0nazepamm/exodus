@@ -643,604 +643,387 @@ void rebuild_mesh(InMesh& m, const FaceSet& fs, const Level& R) {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Approximate reverse subdivision for meshes that are not a subdivision result: polychord
-// collapse. A chord is the strip of quads a run of edges crosses (the dual of an edge loop).
-// Collapsing it merges its two rails and removes its quads, so the mesh stays a quad mesh and the
-// edge flow is kept. Chords go in rounds, cheapest first and never two touching chords in one
-// round, until the face target is reached. On a regular region that removes every other chord in
-// each direction, i.e. exactly one reverse subdivision step; around poles and triangles chords
-// simply end. Each merged vertex slides along its transversal edge to the point of least
-// quadric error, and its UVs and normals are interpolated at the same parameter, per corner, so
-// seams and hard edges stay seams and hard edges.
+// Approximate reverse subdivision for meshes that are not a subdivision result: Blender's
+// un-subdivide (source/blender/bmesh/tools/bmesh_decimate_unsubdivide.cc), extended for per-corner
+// data. A flood fill over edges colours the vertices like a checkerboard and every other one is
+// dissolved: each face around it gives up that corner (the ear it sheds) and the ears join into one
+// polygon of its neighbours. One pass halves the vertices in a diamond pattern; two passes are one
+// reverse subdivision step on a regular grid. Nothing moves and nothing is interpolated: every
+// surviving corner keeps its position, UV and normal. Vertices that cannot go (valence 5 and up,
+// non-manifold fans, locked materials) take no part in the fill; where the pattern does not fit
+// around them, triangles appear. Two additions to Blender: the fill picks its colours so those
+// vertices stay, and afterwards triangle pairs that make a good quad are joined, as Blender's
+// Tris to Quads does.
+//
+// Blender dissolves a vertex on the mesh border as the fan of its one side. A UV seam, hard normal
+// edge or material border through a vertex is treated the same way here: each side is dissolved on
+// its own, so the seam stays an edge and is halved like everything else.
 
-inline Vec3d v_sub(const Vec3d& a, const Vec3d& b) { return {a[0] - b[0], a[1] - b[1], a[2] - b[2]}; }
-inline double v_dot(const Vec3d& a, const Vec3d& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
-inline Vec3d v_lerp(const Vec3d& a, const Vec3d& b, double t) { return {a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), a[2] + t * (b[2] - a[2])}; }
-
-struct Quadric {
-    double a[6] = {}, b[3] = {}, c = 0;  // xx xy xz yy yz zz
-    void add_plane(const Vec3d& n, double d, double w) {
-        a[0] += w * n[0] * n[0]; a[1] += w * n[0] * n[1]; a[2] += w * n[0] * n[2];
-        a[3] += w * n[1] * n[1]; a[4] += w * n[1] * n[2]; a[5] += w * n[2] * n[2];
-        b[0] += w * d * n[0]; b[1] += w * d * n[1]; b[2] += w * d * n[2];
-        c += w * d * d;
-    }
-    void add(const Quadric& o) {
-        for (int i = 0; i < 6; ++i) a[i] += o.a[i];
-        for (int i = 0; i < 3; ++i) b[i] += o.b[i];
-        c += o.c;
-    }
-    Vec3d mul(const Vec3d& p) const {
-        return {a[0] * p[0] + a[1] * p[1] + a[2] * p[2], a[1] * p[0] + a[3] * p[1] + a[4] * p[2], a[2] * p[0] + a[4] * p[1] + a[5] * p[2]};
-    }
-    double eval(const Vec3d& p) const { return v_dot(p, mul(p)) + 2 * (b[0] * p[0] + b[1] * p[1] + b[2] * p[2]) + c; }
-    // parameter along a -> b with the least error
-    double best_t(const Vec3d& pa, const Vec3d& pb) const {
-        const Vec3d d = v_sub(pb, pa);
-        const double alpha = v_dot(d, mul(d));
-        const double beta = 2 * (v_dot(d, mul(pa)) + b[0] * d[0] + b[1] * d[1] + b[2] * d[2]);
-        if (alpha <= 1e-300) return 0.5;
-        return std::clamp(-beta / (2 * alpha), 0.0, 1.0);
-    }
+struct DissolveResult {
+    size_t passes = 0, dissolved = 0, joined = 0;
+    std::string stop;  // why a pass found nothing to dissolve (empty = both passes did work)
 };
 
-struct CoarsenResult {
-    size_t rounds = 0, chords = 0;
-    std::string stop;  // why the target was not reached (empty = reached)
-};
-
-CoarsenResult coarsen_mesh(InMesh& m, size_t targetFaces, const std::vector<uint8_t>& lockedMaterial) {
-    constexpr double kSing = 4.0;   // price of the two singularity pairs a partial chord leaves, spread over its quads
-    constexpr size_t kMinPartial = 6;  // shorter partial chords are not worth their singularities
-    CoarsenResult res;
+DissolveResult dissolve_level(InMesh& m, const std::vector<uint8_t>& lockedMaterial) {
+    struct Corner { uint32_t pos, uv, nrm; };
+    struct Face { std::vector<Corner> c; uint32_t material = 0; bool dead = false; };
     const bool hasN = !m.cornerNrm.empty();
-
-    // Original local edge length per vertex: costs are relative to it, so dense and sparse regions
-    // thin out at the same rate and a chord next to a removed one waits for the next level.
-    std::vector<double> scale(m.positions.size(), 0.0);
-    {
-        const FaceSet fs = faces_of(m);
-        const Topo t = topo_for(fs, m.cornerPos, m.positions.size());
-        std::vector<uint32_t> cnt(t.nv, 0);
-        for (uint32_t e = 0; e < t.ne(); ++e) {
-            const Vec3d d = v_sub(m.positions[t.edgeA[e]], m.positions[t.edgeB[e]]);
-            const double len = std::sqrt(v_dot(d, d));
-            scale[t.edgeA[e]] += len; scale[t.edgeB[e]] += len;
-            ++cnt[t.edgeA[e]]; ++cnt[t.edgeB[e]];
+    const uint32_t nv = (uint32_t)m.positions.size();
+    std::vector<Face> faces(m.faces.size());
+    std::vector<std::vector<uint32_t>> vertFaces(nv);  // live faces per position
+    for (uint32_t f = 0; f < m.faces.size(); ++f) {
+        faces[f].material = m.faces[f].material;
+        for (uint32_t c = m.faces[f].first; c < m.faces[f].first + m.faces[f].count; ++c) {
+            faces[f].c.push_back({m.cornerPos[c], m.cornerUv[c], hasN ? m.cornerNrm[c] : 0});
+            vertFaces[m.cornerPos[c]].push_back(f);
         }
-        for (uint32_t v = 0; v < t.nv; ++v) scale[v] = cnt[v] && scale[v] > 0 ? scale[v] / cnt[v] : 1.0;
     }
 
-    // face normal (Newell); vertices whose repStamp equals `id` are taken from repPos instead
-    std::vector<uint32_t> repStamp;
-    std::vector<Vec3d> repPos;
-    auto newell = [&](const Topo& t, uint32_t f, const std::vector<Vec3d>& pos, uint32_t id) {
-        Vec3d n{0, 0, 0};
-        auto at = [&](uint32_t c) -> const Vec3d& {
-            const uint32_t v = t.idx[c];
-            return id != kNone && repStamp[v] == id ? repPos[v] : pos[v];
+    // One face around a vertex: its corner there, the neighbours before and after it, and the face
+    // across the edge to `next` (which runs the other way there).
+    struct Wedge { uint32_t face, corner, prev, next, succ; bool pred; };
+    std::vector<Wedge> wedges, ring;              // ring: the faces around the vertex in order
+    std::vector<std::vector<Corner>> polys;       // the polygons the ears join into, one per side
+    std::vector<uint32_t> polyMat;
+    std::vector<std::vector<uint32_t>> newFaces;  // positions of every face the dissolve leaves behind
+    auto corner_at = [&](const Wedge& w, int d) -> const Corner& {
+        const std::vector<Corner>& c = faces[w.face].c;
+        return c[(w.corner + c.size() + d) % c.size()];
+    };
+    auto locked = [&](uint32_t mat) { return mat < lockedMaterial.size() && lockedMaterial[mat]; };
+
+    // Can `v` be dissolved: an interior vertex of valence 2-4 (Blender: 3-4 as a fan, 2 as a chain,
+    // which the fan covers) or a border vertex of valence 3, with at most two cuts. `full` also
+    // builds the result and checks it is a clean manifold without duplicate faces; the surroundings
+    // change as neighbours dissolve, so, as in Blender, the fill only uses the topology test.
+    auto plan = [&](uint32_t v, bool full) {
+        const std::vector<uint32_t>& fs = vertFaces[v];
+        const size_t k = fs.size();
+        if (k < 2 || k > 4) return false;
+        wedges.resize(k);
+        for (size_t i = 0; i < k; ++i) {
+            const Face& F = faces[fs[i]];
+            if (locked(F.material)) return false;
+            const uint32_t n = (uint32_t)F.c.size();
+            uint32_t at = kNone;
+            for (uint32_t j = 0; j < n; ++j)
+                if (F.c[j].pos == v) {
+                    if (at != kNone) return false;
+                    at = j;
+                }
+            wedges[i] = {fs[i], at, F.c[(at + n - 1) % n].pos, F.c[(at + 1) % n].pos, kNone, false};
+            if (wedges[i].prev == wedges[i].next) return false;
+        }
+        for (size_t i = 0; i < k; ++i)
+            for (size_t j = 0; j < k; ++j) {
+                if (j == i) continue;
+                if (wedges[j].next == wedges[i].next || wedges[j].prev == wedges[i].prev) return false;  // non-manifold or flipped
+                if (wedges[j].prev == wedges[i].next) { wedges[i].succ = (uint32_t)j; wedges[j].pred = true; }
+            }
+        size_t start = 0, starts = 0;
+        for (size_t i = 0; i < k; ++i)
+            if (!wedges[i].pred) { start = i; ++starts; }
+        const bool closed = starts == 0;
+        if (!closed && (starts != 1 || k != 2)) return false;
+        ring.clear();
+        for (size_t i = start;;) {
+            for (const Wedge& w : ring)
+                if (w.face == wedges[i].face) return false;
+            ring.push_back(wedges[i]);
+            if (ring.size() == k) break;
+            if (wedges[i].succ == kNone) return false;
+            i = wedges[i].succ;
+        }
+        if (closed ? ring.back().succ != start : ring.back().succ != kNone) return false;
+
+        // cuts: a UV seam, hard normal edge or material border between two faces of the ring
+        auto cut = [&](const Wedge& a, const Wedge& b) {  // b follows a across the edge to a.next
+            const Corner &an = corner_at(a, 1), &bp = corner_at(b, -1), &av = corner_at(a, 0), &bv = corner_at(b, 0);
+            return faces[a.face].material != faces[b.face].material || an.uv != bp.uv || an.nrm != bp.nrm ||
+                   av.uv != bv.uv || av.nrm != bv.nrm;
         };
-        for (uint32_t c = t.faceFirst[f]; c < t.faceFirst[f + 1]; ++c) {
-            const Vec3d& p = at(c);
-            const Vec3d& q = at(t.next(c));
-            n[0] += (p[1] - q[1]) * (p[2] + q[2]);
-            n[1] += (p[2] - q[2]) * (p[0] + q[0]);
-            n[2] += (p[0] - q[0]) * (p[1] + q[1]);
-        }
-        return n;
-    };
+        size_t cutAt[2] = {0, 0}, cuts = 0;  // cutAt: first face of a side
+        for (size_t i = 0; i + (closed ? 0 : 1) < k; ++i)
+            if (cut(ring[i], ring[(i + 1) % k])) {
+                if (!closed || cuts == 2) return false;
+                cutAt[cuts++] = (i + 1) % k;
+            }
+        if (cuts == 1) return false;
+        if (!full) return true;
 
-    struct Chord {
-        std::vector<uint32_t> quads;  // in walk order
-        std::vector<uint8_t> entry;   // per quad: corner index of the transversal edge shared with the previous quad
-        bool closed = false;
-    };
-    // One merge of two vertices: the whole transversal edge of a full chord, or the diagonal of a
-    // quad in a partial one. `corner` is the quad corner the pair starts at (its UV / normal and
-    // those of the corner `span` further on are interpolated at `t`).
-    struct Pair { uint32_t A, B, quad, corner; uint8_t span; double t; Vec3d p; };
-    // A collapsible run of quads: a whole chord (edge merges) or a segment of one (diagonal merges).
-    struct Run { std::vector<uint32_t> quads; std::vector<Pair> pairs; bool whole = false, nextLevel = false; double cost = 0; };
-
-    // Level rule: a collapse creates fresh rail edges; a chord that has a fresh edge as one of its
-    // rails is a parallel neighbour of a removed chord and waits for the next level. Crossing
-    // chords (the fresh edge is transversal to them) are fine. So each level removes at most
-    // every other chord per direction, like a real reverse subdivision step. Keys are vertex pairs
-    // in the current numbering, remapped after every round.
-    std::vector<uint64_t> fresh;
-    auto edge_key = [](uint32_t a, uint32_t b) { return a < b ? (uint64_t)a << 32 | b : (uint64_t)b << 32 | a; };
-
-    while (m.faces.size() > targetFaces) {
-        const FaceSet fs = faces_of(m);
-        const Topo t = topo_for(fs, m.cornerPos, m.positions.size());
-        const uint32_t nf = t.nf(), nv = t.nv;
-
-        std::vector<uint8_t> boundary(nv, 0), locked(nv, 0);
-        for (uint32_t e = 0; e < t.ne(); ++e)
-            if (t.edgeFaces(e) != 2) boundary[t.edgeA[e]] = boundary[t.edgeB[e]] = 1;
-        for (uint32_t f = 0; f < nf; ++f)
-            if (m.faces[f].material < lockedMaterial.size() && lockedMaterial[m.faces[f].material])
-                for (uint32_t c = t.faceFirst[f]; c < t.faceFirst[f + 1]; ++c) locked[t.idx[c]] = 1;
-
-        std::vector<Quadric> Q(nv);
-        std::vector<Vec3d> faceN(nf);
-        for (uint32_t f = 0; f < nf; ++f) {
-            const Vec3d n = newell(t, f, m.positions, kNone);
-            faceN[f] = n;
-            const double len = std::sqrt(v_dot(n, n));
-            if (len <= 0) continue;
-            const Vec3d nh = {n[0] / len, n[1] / len, n[2] / len};
-            Vec3d ctr{0, 0, 0};
-            for (uint32_t c = t.faceFirst[f]; c < t.faceFirst[f + 1]; ++c)
-                for (int k = 0; k < 3; ++k) ctr[k] += m.positions[t.idx[c]][k] / t.deg(f);
-            for (uint32_t c = t.faceFirst[f]; c < t.faceFirst[f + 1]; ++c) Q[t.idx[c]].add_plane(nh, -v_dot(nh, ctr), 0.5 * len);
+        // the polygon of one side: its neighbours, winding opposite to the ears it replaces
+        polys.clear();
+        polyMat.clear();
+        auto side = [&](size_t b, size_t len, bool wrap) {
+            std::vector<Corner> p;
+            if (!wrap) p.push_back(corner_at(ring[(b + len - 1) % k], 1));
+            for (size_t s = len; s-- > 0;) p.push_back(corner_at(ring[(b + s) % k], -1));
+            if (p.size() < 3) return;  // a single face: giving up the corner is all there is to do
+            polys.push_back(std::move(p));
+            polyMat.push_back(faces[ring[b].face].material);
+        };
+        if (!closed) side(0, k, false);
+        else if (!cuts) side(0, k, true);
+        else {
+            const size_t len = (cutAt[1] + k - cutAt[0]) % k;
+            side(cutAt[0], len, false);
+            side(cutAt[1], k - len, false);
         }
 
-        // ---- chords -------------------------------------------------------------------------
-        std::vector<uint32_t> chordOf(nf * 2, kNone);  // per quad and parity (0: edges 0-1 / 2-3 are crossed)
-        std::vector<Chord> chords;
-        // cross edge k of quad f: the quad beyond and the edge to leave it through
-        auto step = [&](uint32_t f, int k, uint32_t& g, int& kOut) {
-            const uint32_t e = t.cornerEdge[t.faceFirst[f] + k];
-            if (t.edgeFaces(e) != 2) return false;
-            g = t.faceOf[t.edgeCorners[t.edgeFirst[e]]];
-            if (g == f) g = t.faceOf[t.edgeCorners[t.edgeFirst[e] + 1]];
-            if (g == f || t.deg(g) != 4) return false;
-            for (int j = 0; j < 4; ++j)
-                if (t.cornerEdge[t.faceFirst[g] + j] == e) { kOut = (j + 2) & 3; return true; }
+        // what is left behind: every face of the ring minus its corner at v (a triangle goes), and
+        // the polygons. Each new edge may be used once per direction, twice in all, and no face
+        // may repeat another one.
+        newFaces.clear();
+        for (const Wedge& w : ring) {
+            const std::vector<Corner>& c = faces[w.face].c;
+            if (c.size() <= 3) continue;
+            newFaces.emplace_back();
+            for (uint32_t j = 0; j < c.size(); ++j)
+                if (j != w.corner) newFaces.back().push_back(c[j].pos);
+        }
+        for (const std::vector<Corner>& p : polys) {
+            newFaces.emplace_back();
+            for (const Corner& c : p) newFaces.back().push_back(c.pos);
+        }
+        auto in_ring = [&](uint32_t f) {
+            for (const Wedge& w : ring)
+                if (w.face == f) return true;
             return false;
         };
-        for (uint32_t f = 0; f < nf; ++f) {
-            if (t.deg(f) != 4) continue;
-            for (int p = 0; p < 2; ++p) {
-                if (chordOf[f * 2 + p] != kNone) continue;
-                const uint32_t id = (uint32_t)chords.size();
-                Chord ch;
-                chordOf[f * 2 + p] = id;
-                ch.quads.push_back(f);
-                std::vector<uint32_t> back;
-                for (int dir = 0; dir < 2 && !ch.closed; ++dir) {
-                    uint32_t cur = f;
-                    int k = p + 2 * dir;
-                    for (;;) {
-                        uint32_t g;
-                        int kOut;
-                        if (!step(cur, k, g, kOut)) break;
-                        const uint32_t slot = g * 2 + (kOut & 1);
-                        if (chordOf[slot] == id) { if (g == f && (kOut & 1) == p) ch.closed = true; break; }
-                        chordOf[slot] = id;
-                        (dir ? back : ch.quads).push_back(g);
-                        cur = g;
-                        k = kOut;
-                    }
-                }
-                if (!back.empty()) {
-                    std::reverse(back.begin(), back.end());
-                    back.insert(back.end(), ch.quads.begin(), ch.quads.end());
-                    ch.quads = std::move(back);
-                }
-                // entry edge per quad: the transversal edge shared with the previous quad
-                const size_t n = ch.quads.size();
-                ch.entry.resize(n);
-                for (size_t i = 0; i < n; ++i) {
-                    const uint32_t q = ch.quads[i], base = t.faceFirst[q];
-                    const uint8_t par = (uint8_t)(chordOf[q * 2] == id ? 0 : 1);
-                    uint8_t k = par;
-                    if (n > 1) {
-                        const uint32_t prev = ch.quads[i == 0 ? (ch.closed ? n - 1 : 1) : i - 1], pb = t.faceFirst[prev];
-                        bool shared = false;
-                        for (int j = 0; j < 4 && !shared; ++j) shared = t.cornerEdge[pb + j] == t.cornerEdge[base + par];
-                        k = shared ? par : par + 2;
-                        if (i == 0 && !ch.closed) k = (k + 2) & 3;  // first quad: the edge the chain does not use
-                    }
-                    ch.entry[i] = k;
-                }
-                chords.push_back(std::move(ch));
-            }
-        }
-
-        // ---- runs: whole chords, or the longest usable segments of them ----------------------
-        std::vector<uint32_t> nstamp(nv, kNone), pstamp(nv, kNone), fcount(nf, 0), fstamp(nf, kNone);
-        std::vector<uint32_t> grp(nv), gsize(nv), estamp(t.ne(), kNone), gstamp(nv, kNone), gcnt(nv, 0);
-        std::vector<Vec3d> gacc(nv);
-        auto groot = [&](uint32_t v) { while (grp[v] != v) v = grp[v] = grp[grp[v]]; return v; };
-        std::vector<Run> runs;
-        uint32_t nbStamp = 0;
-        repStamp.assign(nv, kNone);
-        repPos.resize(nv);
-        std::vector<uint8_t> blocked, pairBad;
-        std::vector<uint32_t> segQuads;
-
-        // Fill in the pairs of a run, check them, and return false with the offending quads flagged.
-        auto make_pairs = [&](const Chord& ch, Run& run, const std::vector<uint32_t>& at, uint32_t id) {
-            run.pairs.clear();
-            for (uint32_t i : at) {
-                const uint32_t q = ch.quads[i], base = t.faceFirst[q];
-                const uint8_t k = ch.entry[i];
-                Pair pr;
-                pr.quad = q;
-                if (run.whole) {  // edge merges: each transversal edge once
-                    for (int side = 0; side < 2; ++side) {
-                        const uint32_t c0 = base + ((k + 2 * side) & 3), e = t.cornerEdge[c0];
-                        if (estamp[e] == id) continue;
-                        estamp[e] = id;
-                        pr.corner = c0; pr.span = 1;
-                        pr.A = t.idx[c0]; pr.B = t.idx[t.next(c0)];
-                        run.pairs.push_back(pr);
-                    }
-                } else {  // diagonal from the first corner of the entry edge
-                    pr.corner = base + k; pr.span = 2;
-                    pr.A = t.idx[base + k]; pr.B = t.idx[base + ((k + 2) & 3)];
-                    run.pairs.push_back(pr);
-                }
-            }
-            // Pairs merge into groups. A group is two vertices, or the four corners of a quad the
-            // chord crosses twice (that quad shrinks to a point, as in a real reverse subdivision
-            // step). Anything else (rails meeting at a pole, a vertex in two diagonals) is not
-            // collapsible.
-            for (const Pair& pr : run.pairs)
-                for (uint32_t v : {pr.A, pr.B})
-                    if (pstamp[v] != id) { pstamp[v] = id; grp[v] = v; gsize[v] = 1; }
-            for (const Pair& pr : run.pairs) {
-                if (pr.A == pr.B) return false;
-                const uint32_t ra = groot(pr.A), rb = groot(pr.B);
-                if (ra != rb) { grp[rb] = ra; gsize[ra] += gsize[rb]; }
-            }
-            for (uint32_t q : run.quads) fcount[q] = 0;
-            for (uint32_t q : run.quads) ++fcount[q];
-            for (uint32_t q : run.quads) {
-                if (fcount[q] != 2) continue;
-                const uint32_t r = groot(t.idx[t.faceFirst[q]]);
-                bool same = gsize[r] == 4;
-                for (uint32_t c = t.faceFirst[q] + 1; c < t.faceFirst[q] + 4; ++c) same &= groot(t.idx[c]) == r;
-                if (!same) return false;
-                gsize[r] = 0;  // accounted for
-            }
-            for (const Pair& pr : run.pairs) {
-                const uint32_t s = gsize[groot(pr.A)];
-                if (s != 2 && s != 0) return false;
-            }
-            return true;
-        };
-
-        auto check_pairs = [&](const Chord& ch, Run& run, uint32_t id) {
-            pairBad.assign(run.pairs.size(), 0);
-            double cost = 0;
-            for (size_t pi = 0; pi < run.pairs.size(); ++pi) {
-                Pair& pr = run.pairs[pi];
-                const uint32_t A = pr.A, B = pr.B;
-                bool bad = locked[A] || locked[B];
-                // pinch: both on a border but the pair is not a border edge
-                if (boundary[A] && boundary[B]) {
-                    bool borderEdge = false;
-                    if (run.whole) borderEdge = t.edgeFaces(t.cornerEdge[pr.corner]) == 1;
-                    bad |= !borderEdge;
-                }
-                if (bad) { pairBad[pi] = 1; continue; }
-                // a shared neighbour outside the collapsed quads would fold onto the merged vertex
-                const uint32_t stamp = ++nbStamp;
-                for (uint32_t kk = t.vertFirst[A]; kk < t.vertFirst[A + 1]; ++kk) {
-                    const uint32_t c = t.vertCorners[kk];
-                    nstamp[t.idx[t.next(c)]] = stamp;
-                    nstamp[t.idx[t.prev(c)]] = stamp;
-                }
-                uint32_t allowed[2] = {kNone, kNone};
-                if (!run.whole) {  // the quad's other two corners are legitimately shared
-                    const uint32_t base = t.faceFirst[pr.quad];
-                    allowed[0] = t.idx[base + ((pr.corner - base + 1) & 3)];
-                    allowed[1] = t.idx[base + ((pr.corner - base + 3) & 3)];
-                }
-                for (uint32_t kk = t.vertFirst[B]; kk < t.vertFirst[B + 1] && !bad; ++kk) {
-                    const uint32_t c = t.vertCorners[kk];
-                    for (uint32_t x : {t.idx[t.next(c)], t.idx[t.prev(c)]})
-                        if (x != A && x != allowed[0] && x != allowed[1] && nstamp[x] == stamp) bad = true;
-                }
-                if (bad) { pairBad[pi] = 1; continue; }
-                // UV / normal pairs across a merged edge must be either shared or fully separate
-                if (!bad && run.whole) {
-                    const uint32_t e = t.cornerEdge[pr.corner];
-                    if (t.edgeFaces(e) == 2) {
-                        uint32_t ua[2], ub[2], na[2], nb[2];
-                        for (int s = 0; s < 2; ++s) {
-                            const uint32_t c = t.edgeCorners[t.edgeFirst[e] + s], c1 = t.next(c);
-                            const bool fwd = t.idx[c] == A;
-                            ua[s] = m.cornerUv[fs.srcCorner[fwd ? c : c1]];
-                            ub[s] = m.cornerUv[fs.srcCorner[fwd ? c1 : c]];
-                            na[s] = hasN ? m.cornerNrm[fs.srcCorner[fwd ? c : c1]] : 0;
-                            nb[s] = hasN ? m.cornerNrm[fs.srcCorner[fwd ? c1 : c]] : 0;
-                        }
-                        if ((ua[0] == ua[1]) != (ub[0] == ub[1]) || (na[0] == na[1]) != (nb[0] == nb[1])) bad = true;
-                    }
-                }
-                if (bad) { pairBad[pi] = 1; continue; }
-                // where the merged vertex goes
-                const Vec3d& pa = m.positions[A];
-                const Vec3d& pb = m.positions[B];
-                Quadric q = Q[A];
-                q.add(Q[B]);
-                pr.t = boundary[A] && !boundary[B] ? 0.0 : boundary[B] && !boundary[A] ? 1.0 : q.best_t(pa, pb);
-                pr.p = v_lerp(pa, pb, pr.t);
-                const double err = std::max(0.0, q.eval(pr.p));
-                // cost: the shape error relative to the local original edge length. No size term:
-                // like a real reverse subdivision step, the level rule alternates chords in every
-                // direction whatever the quads' aspect ratio.
-                const double s = 0.5 * (scale[A] + scale[B]);
-                cost += err / (s * s);
-                repStamp[A] = repStamp[B] = id;
-                repPos[A] = repPos[B] = pr.p;
-            }
-            bool anyBad = false;
-            for (uint8_t b : pairBad) anyBad |= b != 0;
-            if (anyBad) return false;
-            // a group of four (a quad the chord crosses twice) goes to the mean of its pair points
-            for (const Pair& pr : run.pairs) {
-                const uint32_t r = groot(pr.A);
-                if (gstamp[r] != id) { gstamp[r] = id; gacc[r] = {0, 0, 0}; gcnt[r] = 0; }
-                for (int d = 0; d < 3; ++d) gacc[r][d] += pr.p[d];
-                ++gcnt[r];
-            }
-            for (const Pair& pr : run.pairs) {
-                const uint32_t r = groot(pr.A);
-                for (uint32_t v : {pr.A, pr.B})
-                    for (int d = 0; d < 3; ++d) repPos[v][d] = gacc[r][d] / gcnt[r];
-            }
-            // no face next to the run may flip or vanish
-            for (uint32_t q : run.quads) fstamp[q] = id;
-            for (size_t pi = 0; pi < run.pairs.size(); ++pi) {
-                for (uint32_t v : {run.pairs[pi].A, run.pairs[pi].B}) {
-                    for (uint32_t kk = t.vertFirst[v]; kk < t.vertFirst[v + 1]; ++kk) {
-                        const uint32_t g = t.faceOf[t.vertCorners[kk]];
-                        if (fstamp[g] == id) continue;
-                        const Vec3d n = newell(t, g, m.positions, id);
-                        if (v_dot(n, faceN[g]) <= 1e-6 * v_dot(faceN[g], faceN[g])) pairBad[pi] = 1;
-                    }
-                }
-            }
-            for (uint8_t b : pairBad) anyBad |= b != 0;
-            if (anyBad) return false;
-            run.cost = cost / run.pairs.size() + (run.whole ? 0.0 : kSing / run.quads.size());
-            return true;
-        };
-
-        uint32_t runId = 0;
-        for (uint32_t ci = 0; ci < chords.size(); ++ci) {
-            const Chord& ch = chords[ci];
-            const size_t n = ch.quads.size();
-            // hard blocks per quad: a locked vertex or a non-manifold transversal edge
-            blocked.assign(n, 0);
-            for (size_t i = 0; i < n; ++i) {
-                const uint32_t q = ch.quads[i], base = t.faceFirst[q];
-                bool b = false;
-                for (uint32_t c = base; c < base + 4; ++c) b |= locked[t.idx[c]] != 0;
-                for (int side = 0; side < 2; ++side) b |= t.edgeFaces(t.cornerEdge[base + ((ch.entry[i] + 2 * side) & 3)]) > 2;
-                blocked[i] = b;
-            }
-            bool anyBlocked = false;
-            for (uint8_t b : blocked) anyBlocked |= b != 0;
-
-            // The whole chord with edge merges when nothing blocks it and it is closed or ends on
-            // the border on both sides; otherwise segments with diagonal merges, split further
-            // wherever a pair fails its checks.
-            std::vector<std::vector<uint32_t>> work;  // quad indices into the chord
-            if (!anyBlocked) {
-                std::vector<uint32_t> all(n);
-                for (uint32_t i = 0; i < n; ++i) all[i] = i;
-                bool ends = ch.closed;
-                if (!ch.closed) {
-                    const uint32_t first = t.cornerEdge[t.faceFirst[ch.quads[0]] + ch.entry[0]];
-                    const uint32_t last = t.cornerEdge[t.faceFirst[ch.quads[n - 1]] + ((ch.entry[n - 1] + 2) & 3)];
-                    ends = t.edgeFaces(first) == 1 && t.edgeFaces(last) == 1;
-                }
-                bool done = false;
-                if (ends) {
-                    Run run;
-                    run.whole = true;
-                    run.quads = ch.quads;
-                    const uint32_t id = ++runId;
-                    if (make_pairs(ch, run, all, id) && check_pairs(ch, run, id)) { runs.push_back(std::move(run)); done = true; }
-                }
-                if (!done) work.push_back(all);
-            } else {
-                size_t start = 0;  // maximal unblocked segments (cyclic for closed chords)
-                if (ch.closed) { while (start < n && !blocked[start]) ++start; }
-                segQuads.clear();
-                for (size_t s = 0; s < n; ++s) {
-                    const size_t i = (start + s) % n;
-                    if (blocked[i]) { if (!segQuads.empty()) work.push_back(segQuads); segQuads.clear(); }
-                    else segQuads.push_back((uint32_t)i);
-                }
-                if (!segQuads.empty()) work.push_back(segQuads);
-            }
-            for (size_t w = 0; w < work.size(); ++w) {
-                const std::vector<uint32_t> at = work[w];
-                if (at.size() < kMinPartial) continue;
-                Run run;
-                for (uint32_t i : at) run.quads.push_back(ch.quads[i]);
-                const uint32_t id = ++runId;
-                if (!make_pairs(ch, run, at, id)) {  // a vertex in two pairs: try the halves
-                    if (at.size() > 1) {
-                        const size_t half = at.size() / 2;
-                        work.push_back(std::vector<uint32_t>(at.begin(), at.begin() + half));
-                        work.push_back(std::vector<uint32_t>(at.begin() + half, at.end()));
-                    }
-                    continue;
-                }
-                if (check_pairs(ch, run, id)) { runs.push_back(std::move(run)); continue; }
-                segQuads.clear();  // split around the bad pairs (one pair per quad)
-                for (size_t pi = 0; pi < at.size(); ++pi) {
-                    if (pairBad[pi]) { if (!segQuads.empty()) work.push_back(segQuads); segQuads.clear(); }
-                    else segQuads.push_back(at[pi]);
-                }
-                if (!segQuads.empty()) work.push_back(segQuads);
-            }
-        }
-
-        // ---- pick the cheapest runs that do not touch ---------------------------------------
-        std::sort(fresh.begin(), fresh.end());
-        size_t waiting = 0;
-        for (Run& run : runs) {
-            for (uint32_t q : run.quads) {
-                const uint32_t base = t.faceFirst[q];
-                uint8_t k = 0;  // the run's transversal edges of this quad start at corner k and k + 2
-                for (const Pair& pr : run.pairs)
-                    if (pr.quad == q) { k = (uint8_t)((pr.corner - base) & 3); break; }
-                for (int side = 0; side < 2; ++side) {
-                    const uint32_t x = t.idx[base + ((k + 1 + 2 * side) & 3)], y = t.idx[base + ((k + 2 + 2 * side) & 3)];
-                    if (std::binary_search(fresh.begin(), fresh.end(), edge_key(x, y))) run.nextLevel = true;
-                }
-            }
-            waiting += run.nextLevel;
-        }
-        std::vector<uint32_t> order;
-        for (uint32_t i = 0; i < runs.size(); ++i)
-            if (!runs[i].nextLevel) order.push_back(i);
-        std::sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) { return runs[x].cost < runs[y].cost; });
-        std::vector<uint8_t> used(nv, 0), dead(nf, 0);
-        std::vector<uint32_t> picked;
-        size_t removed = 0;
-        const size_t needed = m.faces.size() - targetFaces;
-        // whole chords first; partial ones only in a round where no whole chord is left, so their
-        // singularities cannot break whole chords that were still to come in this level
-        size_t wholePicked = 0;
-        for (int pass = 0; pass < 2; ++pass)
-        for (uint32_t id : order) {
-            if (removed >= needed || (pass == 1 && wholePicked)) break;
-            const Run& run = runs[id];
-            if (run.whole != (pass == 0)) continue;
-            bool free = true;
-            for (uint32_t f : run.quads)
-                for (uint32_t c = t.faceFirst[f]; c < t.faceFirst[f + 1] && free; ++c) free = !used[t.idx[c]];
-            if (!free) continue;
-            for (uint32_t f : run.quads) {
-                dead[f] = 1;
-                for (uint32_t c = t.faceFirst[f]; c < t.faceFirst[f + 1]; ++c) used[t.idx[c]] = 1;
-            }
-            picked.push_back(id);
-            removed += run.quads.size();
-            wholePicked += run.whole;
-        }
-        if (std::getenv("UDIM_COARSEN_DEBUG")) {  // per-round trace for tuning
-            size_t whole = 0, part = 0, hist[6] = {};
-            for (uint32_t id : picked) { const Run& r = runs[id]; if (r.whole) ++whole; else { ++part; size_t L = r.quads.size(); ++hist[L >= 32 ? 5 : L >= 16 ? 4 : L >= 8 ? 3 : L >= 4 ? 2 : L >= 2 ? 1 : 0]; } }
-            size_t rw = 0; for (const Run& r : runs) rw += r.whole;
-            std::fprintf(stderr, "round %zu: faces %zu needed %zu removed %zu | runs %zu (whole %zu) picked whole %zu partial %zu len<2:%zu <4:%zu <8:%zu <16:%zu <32:%zu >=32:%zu | cost first %.3g last %.3g\n",
-                         res.rounds + 1, m.faces.size(), needed, removed, runs.size(), rw, whole, part, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5],
-                         picked.empty() ? 0.0 : runs[picked.front()].cost, picked.empty() ? 0.0 : runs[picked.back()].cost);
-        }
-        if (picked.empty()) {
-            if (!res.rounds) res.stop = runs.empty() ? "no collapsible chords" : "chords touch locked ones";
-            break;  // the level is done: every remaining chord waits for the next level
-        }
-
-        // ---- collapse: merge the pairs per channel ----------------------------------------------
-        std::vector<uint32_t> posRoot(nv), uvRoot(m.uvs.size()), nrmRoot(m.normals.size());
-        for (uint32_t i = 0; i < nv; ++i) posRoot[i] = i;
-        for (uint32_t i = 0; i < uvRoot.size(); ++i) uvRoot[i] = i;
-        for (uint32_t i = 0; i < nrmRoot.size(); ++i) nrmRoot[i] = i;
-        auto find = [](std::vector<uint32_t>& root, uint32_t x) {
-            while (root[x] != x) { root[x] = root[root[x]]; x = root[x]; }
-            return x;
-        };
-        std::vector<Vec2d> uvNew = m.uvs;
-        std::vector<Vec3d> nrmNew = m.normals;
-        auto merge_attrs = [&](uint32_t c0, uint32_t c1, double tt) {  // corners of one face, c0 -> c1 at tt
-            const uint32_t u0 = m.cornerUv[fs.srcCorner[c0]], u1 = m.cornerUv[fs.srcCorner[c1]];
-            const uint32_t r0 = find(uvRoot, u0), r1 = find(uvRoot, u1);
-            if (r0 != r1) {
-                uvNew[r0] = {m.uvs[u0].x + tt * (m.uvs[u1].x - m.uvs[u0].x), m.uvs[u0].y + tt * (m.uvs[u1].y - m.uvs[u0].y)};
-                uvRoot[r1] = r0;
-            }
-            if (hasN) {
-                const uint32_t n0 = m.cornerNrm[fs.srcCorner[c0]], n1 = m.cornerNrm[fs.srcCorner[c1]];
-                const uint32_t s0 = find(nrmRoot, n0), s1 = find(nrmRoot, n1);
-                if (s0 != s1) {
-                    Vec3d n = v_lerp(m.normals[n0], m.normals[n1], tt);
-                    const double len = std::sqrt(v_dot(n, n));
-                    if (len > 1e-12) for (double& x : n) x /= len;
-                    nrmNew[s0] = n;
-                    nrmRoot[s1] = s0;
-                }
+        auto count_edge = [](const auto& verts, uint32_t a, uint32_t b, size_t& same, size_t& opp) {
+            for (size_t j = 0; j < verts.size(); ++j) {
+                const uint32_t x = verts[j], y = verts[(j + 1) % verts.size()];
+                same += x == a && y == b;
+                opp += x == b && y == a;
             }
         };
-        for (uint32_t id : picked)
-            for (const Pair& pr : runs[id].pairs) {
-                const uint32_t ra = find(posRoot, pr.A), rb = find(posRoot, pr.B);
-                if (ra != rb) { posRoot[rb] = ra; scale[ra] = 0.5 * (scale[ra] + scale[rb]); }
-            }
-        {   // merged position: mean of the pair points of the group (one pair, or four at a crossing)
-            std::vector<Vec3d> acc(nv, Vec3d{0, 0, 0});
-            std::vector<uint32_t> cnt(nv, 0);
-            for (uint32_t id : picked)
-                for (const Pair& pr : runs[id].pairs) {
-                    const uint32_t r = find(posRoot, pr.A);
-                    for (int d = 0; d < 3; ++d) acc[r][d] += pr.p[d];
-                    ++cnt[r];
-                }
-            for (uint32_t v = 0; v < nv; ++v)
-                if (cnt[v]) for (int d = 0; d < 3; ++d) m.positions[v][d] = acc[v][d] / cnt[v];
-        }
-        for (uint32_t id : picked) {
-            const Run& run = runs[id];
-            for (const Pair& pr : run.pairs) {
-                if (run.whole) {  // both faces on the edge carry their own UV / normal pair
-                    const uint32_t e = t.cornerEdge[pr.corner];
-                    for (uint32_t kk = t.edgeFirst[e]; kk < t.edgeFirst[e + 1]; ++kk) {
-                        const uint32_t c = t.edgeCorners[kk], c1 = t.next(c);
-                        merge_attrs(c, c1, t.idx[c] == pr.A ? pr.t : 1.0 - pr.t);
-                    }
-                } else {
-                    const uint32_t base = t.faceFirst[pr.quad];
-                    merge_attrs(pr.corner, base + ((pr.corner - base + 2) & 3), pr.t);
-                }
-            }
-        }
-        res.chords += picked.size();
-        ++res.rounds;
-
-        // ---- rebuild the mesh --------------------------------------------------------------------
-        InMesh out;
-        out.name = m.name;
-        std::vector<uint32_t> posMap(nv, kNone), uvMap(m.uvs.size(), kNone), nrmMap(m.normals.size(), kNone);
-        std::vector<double> scaleOut;
-        for (uint32_t f = 0; f < nf; ++f) {
-            if (dead[f]) continue;
-            out.faces.push_back({(uint32_t)out.cornerPos.size(), t.deg(f), m.faces[f].material});
-            for (uint32_t c = t.faceFirst[f]; c < t.faceFirst[f + 1]; ++c) {
-                const uint32_t oc = fs.srcCorner[c];
-                const uint32_t pv = find(posRoot, m.cornerPos[oc]);
-                if (posMap[pv] == kNone) { posMap[pv] = (uint32_t)out.positions.size(); out.positions.push_back(m.positions[pv]); scaleOut.push_back(scale[pv]); }
-                out.cornerPos.push_back(posMap[pv]);
-                const uint32_t uv = find(uvRoot, m.cornerUv[oc]);
-                if (uvMap[uv] == kNone) { uvMap[uv] = (uint32_t)out.uvs.size(); out.uvs.push_back(uvNew[uv]); }
-                out.cornerUv.push_back(uvMap[uv]);
-                if (hasN) {
-                    const uint32_t nn = find(nrmRoot, m.cornerNrm[oc]);
-                    if (nrmMap[nn] == kNone) { nrmMap[nn] = (uint32_t)out.normals.size(); out.normals.push_back(nrmNew[nn]); }
-                    out.cornerNrm.push_back(nrmMap[nn]);
-                }
-            }
-        }
-        // fresh rail edges for the level rule, in the new numbering
-        std::vector<uint64_t> freshOut;
-        auto add_fresh = [&](uint32_t a, uint32_t b) {
-            const uint32_t x = posMap[find(posRoot, a)], y = posMap[find(posRoot, b)];
-            if (x != kNone && y != kNone && x != y) freshOut.push_back(edge_key(x, y));
+        auto same_set = [](std::vector<uint32_t> x, std::vector<uint32_t> y) {
+            if (x.size() != y.size()) return false;
+            std::sort(x.begin(), x.end());
+            std::sort(y.begin(), y.end());
+            return x == y;
         };
-        for (uint64_t key : fresh) add_fresh((uint32_t)(key >> 32), (uint32_t)key);
-        for (uint32_t id : picked)
-            for (const Pair& pr : runs[id].pairs) {
-                const uint32_t base = t.faceFirst[pr.quad], k = (pr.corner - base) & 3;
-                for (int side = 0; side < 2; ++side)
-                    add_fresh(t.idx[base + ((k + 1 + 2 * side) & 3)], t.idx[base + ((k + 2 + 2 * side) & 3)]);
+        std::vector<uint32_t> ext;
+        for (size_t i = 0; i < newFaces.size(); ++i) {
+            const std::vector<uint32_t>& F = newFaces[i];
+            for (size_t a = 0; a < F.size(); ++a)
+                for (size_t b = a + 1; b < F.size(); ++b)
+                    if (F[a] == F[b]) return false;
+            for (size_t j = 0; j < F.size(); ++j) {
+                const uint32_t a = F[j], b = F[(j + 1) % F.size()];
+                size_t same = 0, opp = 0;
+                for (uint32_t g : vertFaces[a]) {
+                    if (in_ring(g)) continue;
+                    ext.clear();
+                    for (const Corner& c : faces[g].c) ext.push_back(c.pos);
+                    count_edge(ext, a, b, same, opp);
+                }
+                for (size_t o = 0; o < newFaces.size(); ++o)
+                    if (o != i) count_edge(newFaces[o], a, b, same, opp);
+                if (same || opp > 1) return false;
             }
-        std::sort(freshOut.begin(), freshOut.end());
-        freshOut.erase(std::unique(freshOut.begin(), freshOut.end()), freshOut.end());
-        fresh = std::move(freshOut);
-        m = std::move(out);
-        scale = std::move(scaleOut);
-        if (!wholePicked) break;  // partial chords only get the one last round of a level
+            for (uint32_t g : vertFaces[F[0]]) {
+                if (in_ring(g)) continue;
+                ext.clear();
+                for (const Corner& c : faces[g].c) ext.push_back(c.pos);
+                if (same_set(ext, F)) return false;
+            }
+            for (size_t o = i + 1; o < newFaces.size(); ++o)
+                if (same_set(newFaces[o], F)) return false;
+        }
+        return true;
+    };
+
+    // Dissolve `v` as planned: the ring faces give up their corner at v, the polygons join in.
+    auto dissolve = [&](uint32_t v) {
+        for (const Wedge& w : ring) {
+            Face& F = faces[w.face];
+            if (F.c.size() > 3) {
+                F.c.erase(F.c.begin() + w.corner);
+                continue;
+            }
+            F.dead = true;
+            for (const Corner& c : F.c) {
+                if (c.pos == v) continue;
+                std::vector<uint32_t>& vf = vertFaces[c.pos];
+                vf.erase(std::find(vf.begin(), vf.end(), w.face));
+            }
+        }
+        vertFaces[v].clear();
+        for (size_t i = 0; i < polys.size(); ++i) {
+            const uint32_t id = (uint32_t)faces.size();
+            faces.push_back({std::move(polys[i]), polyMat[i]});
+            for (const Corner& c : faces[id].c) vertFaces[c.pos].push_back(id);
+        }
+    };
+
+    // Two passes of Blender's fill: a flood fill over the vertices that can go colours them in
+    // alternation, and one colour is dissolved. Blender dissolves the colour its seed does not
+    // have. Here each region of the fill dissolves the colour that keeps the vertices around it
+    // that cannot go (poles, seam junctions, border corners), as a real subdivision would: its
+    // extraordinary vertices are always original ones. A pole on the dissolved colour stays behind
+    // with a fan of triangles around it.
+    std::vector<uint8_t> can(nv), parity(nv), marked(nv);
+    std::vector<uint32_t> region(nv), queue, nb;
+    std::vector<std::array<size_t, 2>> votes;  // per region and colour: edges to vertices that cannot go
+    auto neighbours = [&](uint32_t v) {
+        nb.clear();
+        for (uint32_t f : vertFaces[v]) {
+            const std::vector<Corner>& c = faces[f].c;
+            for (size_t j = 0; j < c.size(); ++j)
+                if (c[j].pos == v) {
+                    nb.push_back(c[(j + c.size() - 1) % c.size()].pos);
+                    nb.push_back(c[(j + 1) % c.size()].pos);
+                }
+        }
+        std::sort(nb.begin(), nb.end());
+        nb.erase(std::unique(nb.begin(), nb.end()), nb.end());
+    };
+    DissolveResult res;
+    for (int pass = 0; pass < 2; ++pass) {
+        for (uint32_t v = 0; v < nv; ++v) {
+            can[v] = plan(v, false);
+            region[v] = kNone;
+        }
+        votes.clear();
+        for (uint32_t s = 0; s < nv; ++s) {
+            if (!can[s] || region[s] != kNone) continue;
+            const uint32_t r = (uint32_t)votes.size();
+            votes.push_back({0, 0});
+            region[s] = r;
+            parity[s] = 0;
+            queue.assign(1, s);
+            for (size_t qi = 0; qi < queue.size(); ++qi) {
+                const uint32_t v = queue[qi];
+                neighbours(v);
+                for (uint32_t u : nb) {
+                    if (!can[u]) {
+                        if (!vertFaces[u].empty()) ++votes[r][parity[v]];  // u stays if v goes
+                    } else if (region[u] == kNone) {
+                        region[u] = r;
+                        parity[u] = parity[v] ^ 1;
+                        queue.push_back(u);
+                    }
+                }
+            }
+        }
+        bool any = false;
+        for (uint32_t v = 0; v < nv; ++v) {
+            marked[v] = 0;
+            if (!can[v]) continue;
+            const std::array<size_t, 2>& vt = votes[region[v]];
+            const uint8_t go = vt[0] > vt[1] ? 0 : 1;  // a tie: Blender's choice
+            marked[v] = parity[v] == go;
+            any |= marked[v] != 0;
+        }
+        if (!any) {
+            res.stop = "no vertex can be dissolved";
+            break;
+        }
+        for (uint32_t v = 0; v < nv; ++v)
+            if (marked[v] && plan(v, true)) {
+                dissolve(v);
+                ++res.dissolved;
+            }
+        ++res.passes;
     }
-    triangulate(m);
+
+    // Blender's Tris to Quads (source/blender/bmesh/operators/bmo_join_triangles.cc) on what the
+    // level leaves: triangle pairs that make a good quad are joined, best first by Blender's error
+    // (bend + corners off a right angle + concavity). With its default limits the two halves may
+    // bend by at most 40 degrees and no corner may be more than 40 degrees off a right angle; a
+    // concave quad never joins, and neither does a pair across a seam, hard edge or material border.
+    auto sub = [](const Vec3d& a, const Vec3d& b) { return Vec3d{a[0] - b[0], a[1] - b[1], a[2] - b[2]}; };
+    auto dot = [](const Vec3d& a, const Vec3d& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    auto cross = [](const Vec3d& a, const Vec3d& b) {
+        return Vec3d{a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+    };
+    auto angle = [&](const Vec3d& a, const Vec3d& b) {
+        const double l = std::sqrt(dot(a, a) * dot(b, b));
+        return l > 0 ? std::acos(std::clamp(dot(a, b) / l, -1.0, 1.0)) : 0.0;
+    };
+    auto normal = [&](uint32_t a, uint32_t b, uint32_t c) {
+        return cross(sub(m.positions[b], m.positions[a]), sub(m.positions[c], m.positions[a]));
+    };
+    auto area = [&](uint32_t a, uint32_t b, uint32_t c) { const Vec3d n = normal(a, b, c); return 0.5 * std::sqrt(dot(n, n)); };
+    constexpr double kPi = 3.14159265358979323846, kJoinLimit = 40.0 * kPi / 180.0;
+    struct Join { double error; uint32_t t, g, at, gt; };  // triangles t and g, corners of the shared edge
+    std::vector<Join> joins;
+    for (uint32_t t = 0; t < faces.size() && res.passes; ++t) {
+        const Face& T = faces[t];
+        if (T.dead || T.c.size() != 3 || locked(T.material)) continue;
+        for (uint32_t j = 0; j < 3; ++j) {
+            const Corner &ca = T.c[j], &cb = T.c[(j + 1) % 3], &cc = T.c[(j + 2) % 3];
+            uint32_t g = kNone, gt = 0, users = 0;  // the other face on edge a -> b, which runs b -> a
+            for (uint32_t h : vertFaces[ca.pos]) {
+                if (h == t) continue;
+                const std::vector<Corner>& c = faces[h].c;
+                for (uint32_t k = 0; k < c.size(); ++k) {
+                    const uint32_t x = c[k].pos, y = c[(k + 1) % c.size()].pos;
+                    if (x == cb.pos && y == ca.pos) { g = h; gt = k; ++users; }
+                    else if (x == ca.pos && y == cb.pos) ++users;
+                }
+            }
+            if (users != 1 || g < t) continue;  // each pair once
+            const Face& G = faces[g];
+            if (G.c.size() != 3 || G.material != T.material) continue;
+            const Corner &gb = G.c[gt], &ga = G.c[(gt + 1) % 3], &gd = G.c[(gt + 2) % 3];
+            if (ga.uv != ca.uv || gb.uv != cb.uv || ga.nrm != ca.nrm || gb.nrm != cb.nrm || gd.pos == cc.pos) continue;
+            // the quad (a, d, b, c) in the triangles' winding
+            const uint32_t q[4] = {ca.pos, gd.pos, cb.pos, cc.pos};
+            if (angle(normal(ca.pos, cb.pos, cc.pos), normal(cb.pos, ca.pos, gd.pos)) > kJoinLimit) continue;
+            if (dot(normal(q[0], q[1], q[2]), normal(q[0], q[2], q[3])) <= 0 ||
+                dot(normal(q[1], q[2], q[3]), normal(q[1], q[3], q[0])) <= 0) continue;  // concave or folded
+            Vec3d e[4];
+            for (int i = 0; i < 4; ++i) e[i] = sub(m.positions[q[i]], m.positions[q[(i + 1) % 4]]);
+            double corners = 0, worst = 0;
+            for (int i = 0; i < 4; ++i) {
+                const double off = std::abs(angle(e[i], e[(i + 1) % 4]) - kPi / 2);
+                corners += off;
+                worst = std::max(worst, off);
+            }
+            if (worst > kJoinLimit) continue;
+            const double bend = (angle(normal(q[0], q[1], q[2]), normal(q[0], q[2], q[3])) +
+                                 angle(normal(q[1], q[2], q[3]), normal(q[3], q[0], q[1]))) / (2 * kPi);
+            const double a0 = area(q[0], q[1], q[2]) + area(q[0], q[2], q[3]);
+            const double a1 = area(q[1], q[2], q[3]) + area(q[3], q[0], q[1]);
+            const double concave = std::max(a0, a1) > 0 ? 1.0 - std::min(a0, a1) / std::max(a0, a1) : 1.0;
+            joins.push_back({bend + corners / (2 * kPi) + concave, t, g, j, gt});
+        }
+    }
+    std::sort(joins.begin(), joins.end(), [](const Join& x, const Join& y) { return x.error < y.error; });
+    for (const Join& J : joins) {
+        Face& T = faces[J.t];
+        Face& G = faces[J.g];
+        if (T.dead || G.dead || T.c.size() != 3 || G.c.size() != 3) continue;  // one of them already joined
+        const Corner a = T.c[J.at], b = T.c[(J.at + 1) % 3], c = T.c[(J.at + 2) % 3], d = G.c[(J.gt + 2) % 3];
+        T.c = {a, d, b, c};
+        G.dead = true;
+        for (const Corner& x : G.c) {
+            std::vector<uint32_t>& vf = vertFaces[x.pos];
+            vf.erase(std::find(vf.begin(), vf.end(), J.g));
+        }
+        vertFaces[d.pos].push_back(J.t);
+        ++res.joined;
+    }
+
+    InMesh out;
+    out.name = m.name;
+    out.positions = std::move(m.positions);
+    out.normals = std::move(m.normals);
+    out.uvs = std::move(m.uvs);
+    for (const Face& F : faces) {
+        if (F.dead) continue;
+        out.faces.push_back({(uint32_t)out.cornerPos.size(), (uint32_t)F.c.size(), F.material});
+        for (const Corner& c : F.c) {
+            out.cornerPos.push_back(c.pos);
+            out.cornerUv.push_back(c.uv);
+            if (hasN) out.cornerNrm.push_back(c.nrm);
+        }
+    }
+    compact(out);
+    triangulate(out);
+    m = std::move(out);
     return res;
 }
 
@@ -1275,12 +1058,13 @@ SubdivReport unsubdivide_scene(InScene& scene, const UnsubdivideOptions& opt) {
             rep.materialMismatch += R.materialMismatch;
             if (R.cfFirst.size() == 1) {  // nothing reversed exactly at this level
                 if (opt.exactOnly || m.faces.empty()) break;
-                const CoarsenResult c = coarsen_mesh(m, (m.faces.size() + 3) / 4, opt.keep);
-                mr.chords += c.chords;
-                mr.rounds += c.rounds;
-                mr.stop = c.stop;
-                ++mr.approxLevels;
-                if (!c.stop.empty()) break;
+                const DissolveResult d = dissolve_level(m, opt.keep);
+                mr.dissolved += d.dissolved;
+                mr.passes += d.passes;
+                mr.joined += d.joined;
+                mr.stop = d.stop;
+                if (d.passes) ++mr.approxLevels;
+                if (!d.stop.empty()) break;
                 continue;
             }
             if (opt.solveCage) {

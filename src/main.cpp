@@ -78,8 +78,8 @@ static void usage() {
         "                                value (0-255) for islands whose material lacks this map\n"
         "  --unsubdivide N               reverse N Catmull-Clark subdivision levels (before decimation);\n"
         "                                exact where the mesh is a subdivision result, otherwise every\n"
-        "                                other quad strip is collapsed per level (about half the faces);\n"
-        "                                UVs and normals are kept per corner (seams stay seams)\n"
+        "                                other vertex is dissolved twice per level (Blender's un-subdivide);\n"
+        "                                vertices keep their positions, UVs and normals (seams stay seams)\n"
         "  --unsubdivide-exact           refuse meshes that are not a subdivision result instead\n"
         "  --cage                        with --unsubdivide: recover the control cage positions\n"
         "                                (least squares) instead of keeping the smoothed ones\n"
@@ -412,7 +412,9 @@ struct Packer {
             for (const SubdivReport::Mesh& m : sub.meshes) {
                 say("  %-40s faces %7zu -> %7zu ", m.name.c_str(), m.facesBefore, m.facesAfter);
                 if (m.levels) say(" %d exact", m.levels);
-                if (m.approxLevels) say(" %d approx (%zu chords, %zu rounds)", m.approxLevels, m.chords, m.rounds);
+                if (m.approxLevels)
+                    say(" %d approx (%zu vertices dissolved in %zu passes, %zu triangle pairs joined)", m.approxLevels,
+                        m.dissolved, m.passes, m.joined);
                 if (!m.levels && !m.approxLevels) say(" unchanged");
                 if (m.levels + m.approxLevels < o.unsubdivide) {
                     if (!m.stop.empty()) say("  ! stopped: %s", m.stop.c_str());
@@ -1017,10 +1019,10 @@ struct Packer {
                          sub.fitRms, sub.fitMax);
             for (size_t i = 0; i < sub.meshes.size(); ++i) {
                 const SubdivReport::Mesh& m = sub.meshes[i];
-                std::fprintf(f, "%s{\"name\": %s, \"exact_levels\": %d, \"approx_levels\": %d, \"chords\": %zu, \"faces_in\": %zu, "
-                                "\"faces_out\": %zu, \"kept_faces\": %zu}",
-                             i ? ", " : "", json_str(m.name).c_str(), m.levels, m.approxLevels, m.chords, m.facesBefore, m.facesAfter,
-                             m.keptFaces);
+                std::fprintf(f, "%s{\"name\": %s, \"exact_levels\": %d, \"approx_levels\": %d, \"dissolved\": %zu, \"joined\": %zu, "
+                                "\"faces_in\": %zu, \"faces_out\": %zu, \"kept_faces\": %zu}",
+                             i ? ", " : "", json_str(m.name).c_str(), m.levels, m.approxLevels, m.dissolved, m.joined, m.facesBefore,
+                             m.facesAfter, m.keptFaces);
             }
             std::fprintf(f, "]},\n");
         }

@@ -26,22 +26,22 @@ struct UnsubdivideOptions {
     std::vector<uint8_t> keep; // per material: 1 = its faces and vertices are never touched by coarsening
 };
 
-// A level that cannot be reversed exactly is approximated by polychord collapse: whole quad
-// strips (the dual of edge loops) are removed, cheapest first and never two touching ones in a
-// round, until the mesh has a quarter of its faces. The mesh stays a quad mesh with its edge
-// flow; merged vertices slide along their edge to the point of least quadric error and their
-// UVs and normals are interpolated at the same parameter, corner by corner.
+// A level that cannot be reversed exactly is approximated the way Blender's un-subdivide does it:
+// two passes that each dissolve every other vertex in a checkerboard pattern. Surviving vertices
+// keep their positions, UVs and normals; triangles appear where the pattern meets poles, and pairs
+// of them that make a good quad are joined again.
 struct SubdivReport {
     struct Mesh {
         std::string name;
         size_t facesBefore = 0, facesAfter = 0;
         int levels = 0;                 // levels reversed exactly (or applied, for the forward pass)
-        int approxLevels = 0;           // levels approximated by chord collapse
-        size_t chords = 0, rounds = 0;  // chord collapse work
+        int approxLevels = 0;              // levels approximated by checkerboard dissolve
+        size_t dissolved = 0, passes = 0;  // vertices dissolved, dissolve passes
+        size_t joined = 0;                 // triangle pairs joined into quads afterwards
         size_t keptFaces = 0;           // faces left untouched at the last exact level (not a subdivision result)
         size_t keptSets = 0;            // face sets those faces belong to
         std::string reason;             // why the last attempted exact level did not (fully) reverse; empty = fine
-        std::string stop;               // why chord collapse stopped short of its target; empty = reached
+        std::string stop;               // why a dissolve pass found nothing to do; empty = fine
         double fitRms = 0, fitMax = 0;  // solveCage: cage re-subdivided vs input, relative to scene size
     };
     std::vector<Mesh> meshes;
