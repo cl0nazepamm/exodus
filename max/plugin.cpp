@@ -1,16 +1,17 @@
-// udimpacker for 3ds Max 2027: the plugin Max loads at startup. It publishes the `udimpacker`
-// MAXScript interface and hands the work to udimpacker_maxcore.dll. That DLL is loaded from a copy
-// in the temp folder, so a rebuild can replace it while Max runs and udimpacker.reload() picks up
-// the new one without a restart.
-#include <max.h>
+// udimpacker for 3ds Max 2027: the plugin Max loads at startup. It registers the modifiers,
+// publishes the `udimpacker` MAXScript interface and hands the work to udimpacker_maxcore.dll.
+// That DLL is loaded from a copy in the temp folder, so a rebuild can replace it while Max runs
+// and udimpacker.reload() picks up the new one without a restart.
 #include <gup.h>
-#include <iparamb2.h>
 #include <ifnpub.h>
+#include <Util/MainThreadTaskManager.h>
 
 #include <filesystem>
+#include <map>
+#include <mutex>
 #include <string>
 
-#include "maxcore_api.h"
+#include "plugin.h"
 
 HINSTANCE hInstance = nullptr;
 
@@ -31,6 +32,7 @@ fs::path core_source() {
 }
 
 struct Core {
+    std::mutex lock;
     HMODULE module = nullptr;
     const UdimCoreApi* api = nullptr;
     fs::path copy;
@@ -78,7 +80,10 @@ struct Core {
         return true;
     }
 
-    bool ready() { return api || load(); }
+    const UdimCoreApi* get() {
+        std::lock_guard guard(lock);
+        return api || load() ? api : nullptr;
+    }
 } core;
 
 // Runs a core function that writes UTF-8 text and returns that text.
@@ -90,33 +95,45 @@ MSTR collect(F&& call) {
     return MSTR::FromUTF8(text.c_str());
 }
 
-MSTR core_error() { return MSTR(_M("{\"error\": \"udimpacker core: ")) + core.error + _M("\"}"); }
+MSTR json_error(const MSTR& what) { return MSTR(_M("{\"error\": \"")) + what + _M("\"}"); }
 
 class UdimInterface : public FPStaticInterface {
 public:
     DECLARE_DESCRIPTOR(UdimInterface)
-    enum { kVersion, kReload, kInspect };
+    enum { kVersion, kReload, kInspect, kSync };
 
     BEGIN_FUNCTION_MAP
     FN_0(kVersion, TYPE_TSTR_BV, Version)
     FN_0(kReload, TYPE_TSTR_BV, Reload)
     FN_1(kInspect, TYPE_TSTR_BV, Inspect, TYPE_INODE)
+    VFN_0(kSync, Sync)
     END_FUNCTION_MAP
 
+    // Runs the work the modifiers left for after the evaluation (Skin weight updates) right now,
+    // for scripts that change a modifier and read Skin in the same go.
+    void Sync() { IMainThreadTaskManager::GetInstance()->ExecutePendingTasks(); }
+
     MSTR Version() {
-        if (!core.ready()) return core_error();
-        return MSTR(_M("udimpacker core ")) + MSTR::FromUTF8(core.api->build) + _M(" from ") + core.loadedFrom;
+        const UdimCoreApi* api = udim_core();
+        if (!api) return udim_core_error();
+        return MSTR(_M("udimpacker core ")) + MSTR::FromUTF8(api->build) + _M(" from ") + core.loadedFrom;
     }
 
     MSTR Reload() {
-        core.unload();
-        return Version();
+        {
+            std::lock_guard guard(core.lock);
+            core.unload();
+        }
+        MSTR v = Version();
+        unsubdivide_refresh_all();
+        return v;
     }
 
     MSTR Inspect(INode* node) {
-        if (!node) return MSTR(_M("{\"error\": \"no node\"}"));
-        if (!core.ready()) return core_error();
-        return collect([&](UdimSink sink) { core.api->inspect(node, sink); });
+        if (!node) return json_error(_M("no node"));
+        const UdimCoreApi* api = udim_core();
+        if (!api) return json_error(udim_core_error());
+        return collect([&](UdimSink sink) { api->inspect(node, sink); });
     }
 };
 
@@ -126,6 +143,7 @@ UdimInterface theInterface(kInterfaceId, _M("udimpacker"), 0, nullptr, FP_CORE,
     UdimInterface::kReload, _M("reload"), 0, TYPE_TSTR_BV, FP_NO_REDRAW, 0,
     UdimInterface::kInspect, _M("inspect"), 0, TYPE_TSTR_BV, FP_NO_REDRAW, 1,
         _M("node"), 0, TYPE_INODE,
+    UdimInterface::kSync, _M("sync"), 0, TYPE_VOID, 0, 0,
     p_end);
 // clang-format on
 
@@ -155,6 +173,20 @@ UdimGupClassDesc gupDesc;
 
 }  // namespace
 
+const MCHAR* udim_string(int id) {  // one stored string per id: Max may keep the pointer
+    static std::map<int, MSTR> strings;
+    auto [it, fresh] = strings.try_emplace(id);
+    if (fresh) {
+        MCHAR buf[256];
+        if (hInstance && LoadStringW(hInstance, id, buf, _countof(buf))) it->second = buf;
+    }
+    return it->second.data();
+}
+
+const UdimCoreApi* udim_core() { return core.get(); }
+
+MSTR udim_core_error() { return MSTR(_M("udimpacker core: ")) + core.error; }
+
 BOOL WINAPI DllMain(HINSTANCE instance, ULONG reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         hInstance = instance;
@@ -164,7 +196,13 @@ BOOL WINAPI DllMain(HINSTANCE instance, ULONG reason, LPVOID) {
 }
 
 __declspec(dllexport) const MCHAR* LibDescription() { return _M("udimpacker: unsubdivide, decimate and UDIM packing"); }
-__declspec(dllexport) int LibNumberClasses() { return 1; }
-__declspec(dllexport) ClassDesc* LibClassDesc(int i) { return i == 0 ? &gupDesc : nullptr; }
+__declspec(dllexport) int LibNumberClasses() { return 2; }
+__declspec(dllexport) ClassDesc* LibClassDesc(int i) {
+    switch (i) {
+    case 0: return &gupDesc;
+    case 1: return unsubdivide_desc();
+    default: return nullptr;
+    }
+}
 __declspec(dllexport) ULONG LibVersion() { return VERSION_3DSMAX; }
 __declspec(dllexport) ULONG CanAutoDefer() { return 0; }  // load at startup: the interface must exist from the start
