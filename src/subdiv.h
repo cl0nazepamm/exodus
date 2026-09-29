@@ -27,25 +27,26 @@ struct UnsubdivideOptions {
     std::vector<uint8_t> keep; // per material: 1 = its faces and vertices are never touched by coarsening
 };
 
-// A level that cannot be reversed exactly is approximated the way Blender's un-subdivide does it:
-// two passes that each dissolve every other vertex in a checkerboard pattern. Surviving vertices
-// keep their positions, UVs and normals; triangles appear where the pattern meets poles, and pairs
-// of them that make a good quad are joined again.
+// A level that cannot be reversed exactly is approximated by coarsening: fine quads are grouped
+// into blocks of about four around centre vertices, cut at seams, and the block outlines become the
+// coarse faces. Surviving vertices keep their positions, UVs and normals. Where the grouping does
+// not work out (poles) neighbouring odd faces are merged and cut into quads; a few triangles stay.
 struct SubdivReport {
     struct Mesh {
         std::string name;
         size_t facesBefore = 0, facesAfter = 0;
         int levels = 0;                 // levels reversed exactly (or applied, for the forward pass)
-        int approxLevels = 0;              // levels approximated by checkerboard dissolve
-        size_t dissolved = 0, passes = 0;  // vertices dissolved, dissolve passes
-        size_t joined = 0;                 // triangle pairs joined into quads afterwards
-        size_t unpaired = 0;               // dissolves and joins left out to stay symmetric
+        int approxLevels = 0;              // levels approximated by coarsening
+        size_t removed = 0;                // vertices removed by coarsening
+        size_t paired = 0;                 // odd faces merged with a neighbour into quads
+        size_t triangles = 0;              // triangles left after the last coarsened level
+        size_t unpaired = 0;               // merges left out to stay symmetric
         int mirrorAxis = -1;               // mirror found at the last approximate level (-1 = none)
         double mirrored = 0;               // share of its vertices with a mirror image
         size_t keptFaces = 0;           // faces left untouched at the last exact level (not a subdivision result)
         size_t keptSets = 0;            // face sets those faces belong to
         std::string reason;             // why the last attempted exact level did not (fully) reverse; empty = fine
-        std::string stop;               // why a dissolve pass found nothing to do; empty = fine
+        std::string stop;               // why coarsening found nothing to do; empty = fine
         double fitRms = 0, fitMax = 0;  // solveCage: cage re-subdivided vs input, relative to scene size
     };
     std::vector<Mesh> meshes;

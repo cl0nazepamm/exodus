@@ -229,8 +229,8 @@ void Packer::subdivision() {
             say("  %-40s faces %7zu -> %7zu ", m.name.c_str(), m.facesBefore, m.facesAfter);
             if (m.levels) say(" %d exact", m.levels);
             if (m.approxLevels)
-                say(" %d approx (%zu vertices dissolved in %zu passes, %zu triangle pairs joined)", m.approxLevels,
-                    m.dissolved, m.passes, m.joined);
+                say(" %d approx (%zu vertices removed, %zu odd faces paired into quads, %zu triangles left)", m.approxLevels,
+                    m.removed, m.paired, m.triangles);
             if (m.approxLevels && m.mirrorAxis >= 0)
                 say(" mirror %c on %.1f%% of the vertices (%zu left out to stay symmetric)", "xyz"[m.mirrorAxis],
                     m.mirrored * 100, m.unpaired);
@@ -846,9 +846,9 @@ void Packer::write_manifest(const std::vector<std::string>& files) {
                      sub.fitRms, sub.fitMax);
         for (size_t i = 0; i < sub.meshes.size(); ++i) {
             const SubdivReport::Mesh& m = sub.meshes[i];
-            std::fprintf(f, "%s{\"name\": %s, \"exact_levels\": %d, \"approx_levels\": %d, \"dissolved\": %zu, \"joined\": %zu, "
+            std::fprintf(f, "%s{\"name\": %s, \"exact_levels\": %d, \"approx_levels\": %d, \"removed\": %zu, \"paired\": %zu, \"triangles\": %zu, "
                             "\"faces_in\": %zu, \"faces_out\": %zu, \"kept_faces\": %zu}",
-                         i ? ", " : "", json_str(m.name).c_str(), m.levels, m.approxLevels, m.dissolved, m.joined, m.facesBefore,
+                         i ? ", " : "", json_str(m.name).c_str(), m.levels, m.approxLevels, m.removed, m.paired, m.triangles, m.facesBefore,
                          m.facesAfter, m.keptFaces);
         }
         std::fprintf(f, "]},\n");
