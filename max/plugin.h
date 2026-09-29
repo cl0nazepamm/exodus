@@ -15,4 +15,5 @@ const UdimCoreApi* udim_core();
 MSTR udim_core_error();
 
 ClassDesc2* unsubdivide_desc();
-void unsubdivide_refresh_all();  // after the core DLL was reloaded: recompute every instance
+ClassDesc2* decimate_desc();
+void reduce_refresh_all();  // after the core DLL was reloaded: recompute every reducing modifier

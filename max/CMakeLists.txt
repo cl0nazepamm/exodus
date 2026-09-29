@@ -23,7 +23,7 @@ target_link_libraries(udimpacker_maxcore PRIVATE udimpacker_core core maxutil ge
 set_target_properties(udimpacker_maxcore PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/max/core/$<0:>")
 
 # The plugin Max loads at startup (registered through Plugin.UserSettings.ini, see README).
-add_library(udimpacker_max SHARED plugin.cpp unsubdivide.cpp udimpacker.rc plugin.def)
+add_library(udimpacker_max SHARED plugin.cpp reduce.cpp udimpacker.rc plugin.def)
 udim_max_settings(udimpacker_max)
 target_link_libraries(udimpacker_max PRIVATE core maxutil geom mesh mnmath poly paramblk2 gup)
 set_target_properties(udimpacker_max PROPERTIES

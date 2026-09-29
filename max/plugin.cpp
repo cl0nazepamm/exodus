@@ -125,7 +125,7 @@ public:
             core.unload();
         }
         MSTR v = Version();
-        unsubdivide_refresh_all();
+        reduce_refresh_all();
         return v;
     }
 
@@ -196,11 +196,12 @@ BOOL WINAPI DllMain(HINSTANCE instance, ULONG reason, LPVOID) {
 }
 
 __declspec(dllexport) const MCHAR* LibDescription() { return _M("udimpacker: unsubdivide, decimate and UDIM packing"); }
-__declspec(dllexport) int LibNumberClasses() { return 2; }
+__declspec(dllexport) int LibNumberClasses() { return 3; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
     case 0: return &gupDesc;
     case 1: return unsubdivide_desc();
+    case 2: return decimate_desc();
     default: return nullptr;
     }
 }

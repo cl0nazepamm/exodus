@@ -9,6 +9,7 @@
 #include <stdmat.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -17,6 +18,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "decimate.h"
 #include "maxcore_api.h"
 #include "subdiv.h"
 #include "udimpacker.h"
@@ -24,6 +26,7 @@
 namespace {
 
 const char kBuild[] = __DATE__ " " __TIME__;
+constexpr uint32_t kNone = UINT32_MAX;
 
 std::string utf8(const MSTR& s) { return std::string(s.ToUTF8().data()); }
 
@@ -237,9 +240,9 @@ bool inspect(INode* node, UdimSink out) {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Unsubdivide on an MNMesh. Corners are numbered over the live faces in order. Every corner gets a
-// wedge id: its values in every map channel, its explicit normal and its face's smoothing group.
-// Unsubdivide sees the wedges as its UVs, so a change in any of them is a seam it keeps.
+// MNMesh and udimpacker's mesh. Corners are numbered over the live faces in order. Every corner
+// gets a wedge id: its values in every map channel, its explicit normal and its face's smoothing
+// group; a change in any of them is a seam the algorithms keep.
 
 struct CornerTable {
     std::vector<int> faces;         // live faces in order
@@ -287,11 +290,17 @@ struct Fnv {
     }
 };
 
-uint64_t unsubdivide_signature(MNMesh& m, const UdimUnsubdivide& s) {
+// Settings of one kind of plan, and the core build (a new build makes new plans).
+Fnv settings_hash(char kind) {
     Fnv h;
     for (const char* p = kBuild; *p; ++p) h.add((unsigned char)*p);
-    h.add((uint64_t)s.levels);
-    h.add(s.symmetry);
+    h.add((unsigned char)kind);
+    return h;
+}
+
+// The input topology a plan depends on: faces, vertices, map faces, normal faces, materials,
+// smoothing groups. Positions are left out: below Skin they do not change.
+uint64_t topology_hash(MNMesh& m, Fnv h) {
     h.add((uint64_t)m.VNum());
     h.add((uint64_t)m.FNum());
     const std::vector<int> maps = live_maps(m);
@@ -313,24 +322,33 @@ uint64_t unsubdivide_signature(MNMesh& m, const UdimUnsubdivide& s) {
     return h.h;
 }
 
-bool unsubdivide_plan(MNMesh& m, const UdimUnsubdivide& s, UdimPlan& plan) {
-    plan = {};
-    plan.signature = unsubdivide_signature(m, s);
-    const CornerTable ct = corners_of(m);
+// The mesh as udimpacker's: corners carry their input corner (cornerSrc) and wedge (cornerSeam).
+// Without `values` the wedges stand in for the UVs (unsubdivide only compares them); with it the
+// UVs are channel 1, the normals the explicit normals, and the faces are triangulated (decimate).
+InMesh to_inmesh(MNMesh& m, const CornerTable& ct, bool values) {
     const std::vector<int> maps = live_maps(m);
     MNNormalSpec* ns = live_normals(m);
-
-    InScene scene;
-    InMesh& im = scene.meshes.emplace_back();
+    const MNMap* uv = values && std::find(maps.begin(), maps.end(), 1) != maps.end() ? m.M(1) : nullptr;
+    InMesh im;
     im.name = "max";
     im.positions.resize(m.VNum());
     for (int v = 0; v < m.VNum(); ++v) im.positions[v] = {m.P(v).x, m.P(v).y, m.P(v).z};
+    if (values) {
+        if (uv)
+            for (int i = 0; i < uv->VNum(); ++i) im.uvs.push_back({uv->v[i].x, uv->v[i].y});
+        im.uvs.push_back({});  // the UV of corners without one
+        if (ns) {
+            for (int i = 0; i < ns->GetNumNormals(); ++i) im.normals.push_back({ns->Normal(i).x, ns->Normal(i).y, ns->Normal(i).z});
+            im.normals.push_back({0, 0, 1});  // the normal of corners without one
+        }
+    }
     std::unordered_map<std::string, uint32_t> wedges;
     std::string key;
     auto put = [&](int32_t x) { key.append(reinterpret_cast<const char*>(&x), sizeof x); };
+    Tab<int> tri;
     for (size_t i = 0; i < ct.faces.size(); ++i) {
         const int f = ct.faces[i];
-        const MNFace* F = m.F(f);
+        MNFace* F = m.F(f);
         im.faces.push_back({ct.first[i], (uint32_t)F->deg, (uint32_t)F->material});
         for (int k = 0; k < F->deg; ++k) {
             im.cornerPos.push_back((uint32_t)F->vtx[k]);
@@ -339,18 +357,36 @@ bool unsubdivide_plan(MNMesh& m, const UdimUnsubdivide& s, UdimPlan& plan) {
             put((int32_t)F->smGroup);
             put(ns ? ns->Face(f).GetNormalID(k) : -1);
             for (int mp : maps) put(m.M(mp)->F(f)->tv[k]);
-            im.cornerUv.push_back(wedges.emplace(key, (uint32_t)wedges.size()).first->second);
+            const uint32_t wedge = wedges.emplace(key, (uint32_t)wedges.size()).first->second;
+            im.cornerSeam.push_back(wedge);
+            if (!values) {
+                im.cornerUv.push_back(wedge);
+            } else {
+                im.cornerUv.push_back(uv ? (uint32_t)uv->F(f)->tv[k] : (uint32_t)im.uvs.size() - 1);
+                if (ns) {
+                    const int n = ns->Face(f).GetNormalID(k);
+                    im.cornerNrm.push_back(n >= 0 ? (uint32_t)n : (uint32_t)im.normals.size() - 1);
+                }
+            }
+        }
+        if (values) {
+            F->GetTriangles(tri);
+            for (int t = 0; t + 2 < tri.Count(); t += 3) {
+                im.tris.push_back({ct.first[i] + tri[t], ct.first[i] + tri[t + 1], ct.first[i] + tri[t + 2]});
+                im.triFace.push_back((uint32_t)i);
+            }
         }
     }
-    im.uvs.resize(wedges.size());
+    if (!values) im.uvs.resize(wedges.size());
+    return im;
+}
 
-    UnsubdivideOptions opt;
-    opt.levels = s.levels;
-    opt.symmetry = s.symmetry;
-    const SubdivReport rep = unsubdivide_scene(scene, opt);
-    const InMesh& r = scene.meshes[0];
+// The plan from an algorithm's result mesh (corners carry their input corner).
+bool finish_plan(MNMesh& m, const CornerTable& ct, const InMesh& r, UdimPlan& plan) {
     if (r.cornerSrc.size() != r.cornerPos.size()) return false;
-    plan.faceFirst.reserve(r.faces.size() + 1);
+    plan.faceFirst.clear();
+    plan.corner.clear();
+    plan.vertex.clear();
     for (const InFace& f : r.faces) {
         plan.faceFirst.push_back((uint32_t)plan.corner.size());
         for (uint32_t k = 0; k < f.count; ++k) plan.corner.push_back(r.cornerSrc[f.first + k]);
@@ -360,6 +396,27 @@ bool unsubdivide_plan(MNMesh& m, const UdimUnsubdivide& s, UdimPlan& plan) {
     for (uint32_t c : plan.corner) used[m.F(ct.face[c])->vtx[ct.k[c]]] = 1;
     for (int v = 0; v < m.VNum(); ++v)
         if (used[v]) plan.vertex.push_back((uint32_t)v);
+    return true;
+}
+
+uint64_t unsubdivide_signature(MNMesh& m, const UdimUnsubdivide& s) {
+    Fnv h = settings_hash('U');
+    h.add((uint64_t)s.levels);
+    h.add(s.symmetry);
+    return topology_hash(m, h);
+}
+
+bool unsubdivide_plan(MNMesh& m, const UdimUnsubdivide& s, UdimPlan& plan) {
+    plan = {};
+    plan.signature = unsubdivide_signature(m, s);
+    const CornerTable ct = corners_of(m);
+    InScene scene;
+    scene.meshes.push_back(to_inmesh(m, ct, false));
+    UnsubdivideOptions opt;
+    opt.levels = s.levels;
+    opt.symmetry = s.symmetry;
+    const SubdivReport rep = unsubdivide_scene(scene, opt);
+    if (!finish_plan(m, ct, scene.meshes[0], plan)) return false;
 
     const SubdivReport::Mesh& mr = rep.meshes[0];
     char line[256];
@@ -372,6 +429,34 @@ bool unsubdivide_plan(MNMesh& m, const UdimUnsubdivide& s, UdimPlan& plan) {
         plan.report += line;
     }
     if (!mr.stop.empty()) plan.report += " (stopped: " + mr.stop + ")";
+    return true;
+}
+
+uint64_t decimate_signature(MNMesh& m, const UdimDecimate& s) {
+    Fnv h = settings_hash('D');
+    h.add(std::bit_cast<uint32_t>(s.percent));
+    h.add(s.lockBorder);
+    return topology_hash(m, h);
+}
+
+bool decimate_plan(MNMesh& m, const UdimDecimate& s, UdimPlan& plan) {
+    plan = {};
+    plan.signature = decimate_signature(m, s);
+    const CornerTable ct = corners_of(m);
+    InScene scene;
+    scene.meshes.push_back(to_inmesh(m, ct, true));
+    const size_t tris = scene.meshes[0].tris.size();
+    uint32_t maxMaterial = 0;
+    for (const InFace& f : scene.meshes[0].faces) maxMaterial = std::max(maxMaterial, f.material);
+    DecimateOptions opt;
+    opt.targetTris = std::max<size_t>(1, (size_t)std::llround((double)tris * std::clamp((double)s.percent, 0.0, 100.0) / 100.0));
+    opt.maxError = -1;
+    opt.lockBorder = s.lockBorder;
+    const DecimateResult r = decimate_scene(scene, std::vector<uint8_t>(maxMaterial + 1, 0), opt);
+    if (scene.meshes.empty() || !finish_plan(m, ct, scene.meshes[0], plan)) return false;
+    char line[256];
+    std::snprintf(line, sizeof line, "%zu -> %zu triangles, error %.3g%%", r.before, r.after, r.error * 100);
+    plan.report = line;
     return true;
 }
 
@@ -388,6 +473,8 @@ struct Remap {
     int operator[](int i) const { return i >= 0 && i < (int)to.size() ? to[i] : -1; }
 };
 
+// The result: the plan's faces with the input's own vertices, map channels, explicit normals,
+// material IDs and smoothing groups, each renumbered in its original order.
 bool apply_plan(MNMesh& m, const UdimPlan& plan, MNMesh& out) {
     const CornerTable ct = corners_of(m);
     const size_t nc = ct.face.size();
@@ -417,7 +504,6 @@ bool apply_plan(MNMesh& m, const UdimPlan& plan, MNMesh& out) {
         F->smGroup = srcFace(f)->smGroup;
     }
 
-    // map channels, each renumbered on its own
     out.SetMapNum(m.MNum());
     const std::vector<int> maps = live_maps(m);
     for (int mp = -NUM_HIDDENMAPS; mp < m.MNum(); ++mp) {
@@ -449,7 +535,6 @@ bool apply_plan(MNMesh& m, const UdimPlan& plan, MNMesh& out) {
     for (int f = 0; f < nf; ++f)
         if (out.F(f)->deg > 3) out.RetriangulateFace(f);
 
-    // explicit normals, renumbered
     if (MNNormalSpec* sn = live_normals(m)) {
         Remap nr(sn->GetNumNormals());
         for (uint32_t c : plan.corner) nr.use(sn->Face(ct.face[c]).GetNormalID(ct.k[c]));
@@ -479,12 +564,12 @@ bool apply_plan(MNMesh& m, const UdimPlan& plan, MNMesh& out) {
 }
 
 // ------------------------------------------------------------------------------------------------
-// The Unsubdivide modifier below Skin. Skin remaps its weights by position when the vertex count
-// changes: a vertex within 0.00001 of an old one takes its weights exactly (bonesdef
-// RemapVertData), others get a blend of their neighbours. Every vertex the modifier keeps is an
-// input vertex at its input position, so going down in resolution is exact on its own. A vertex
-// that comes back when the level goes down again is one Skin no longer has, so the modifier keeps
-// a copy of every input vertex's weights and writes them back after the evaluation.
+// Reducing modifiers below Skin (Unsubdivide, Decimate). Skin remaps its weights by position when
+// the vertex count changes: a vertex within 0.00001 of an old one takes its weights exactly
+// (bonesdef RemapVertData), others get a blend of their neighbours. Every vertex these modifiers
+// keep is an input vertex at its input position, so going down in resolution is exact on its own.
+// A vertex that comes back is one Skin no longer has, so each modifier keeps a copy of Skin's
+// weights by position and the one nearest the Skin writes them back after the evaluation.
 
 // The node a modifier context belongs to: Max passes no node to an object space modifier's
 // ModifyObject (one modifier can sit on several nodes), so it is found the way the SDK's own
@@ -509,14 +594,15 @@ INode* node_of(Modifier* mod, ModContext* mc) {
     return nullptr;
 }
 
-// The nearest Skin above a modifier on a node.
+// The nearest Skin above a modifier on a node, and whether another reducing modifier sits between.
 struct SkinAbove {
     Modifier* mod = nullptr;
     ISkin* skin = nullptr;
     ISkinContextData* ctx = nullptr;
+    bool top = false;  // no other reducing modifier between this one and the Skin
 };
 
-SkinAbove skin_above(INode* node, Modifier* self) {
+SkinAbove skin_above(INode* node, Modifier* self, UdimIsReducer isReducer) {
     SkinAbove s;
     if (!node) return s;
     for (Object* obj = node->GetObjectRef(); obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID;
@@ -524,18 +610,47 @@ SkinAbove skin_above(INode* node, Modifier* self) {
         auto* d = static_cast<IDerivedObject*>(obj);
         for (int i = 0; i < d->NumModifiers(); ++i) {
             if (d->GetModifier(i) != self) continue;
-            for (int j = i - 1; j >= 0; --j)
-                if (auto* sk = static_cast<ISkin*>(d->GetModifier(j)->GetInterface(I_SKIN))) {
-                    s.mod = d->GetModifier(j);
+            s.top = true;
+            for (int j = i - 1; j >= 0; --j) {
+                Modifier* m = d->GetModifier(j);
+                if (auto* sk = static_cast<ISkin*>(m->GetInterface(I_SKIN))) {
+                    s.mod = m;
                     s.skin = sk;
                     s.ctx = sk->GetContextInterface(node);
                     break;
                 }
+                if (isReducer && isReducer(m)) s.top = false;
+            }
             return s;
         }
     }
     return s;
 }
+
+// Positions compared bit for bit (-0 and +0 alike).
+struct PosHash {
+    size_t operator()(const UdimPos& p) const {
+        uint64_t h = 1469598103934665603ull;
+        for (float x : p) {
+            h ^= std::bit_cast<uint32_t>(x + 0.0f);
+            h *= 1099511628211ull;
+        }
+        return (size_t)h;
+    }
+};
+
+struct PosIndex {
+    std::unordered_map<UdimPos, uint32_t, PosHash> at;
+    explicit PosIndex(const UdimSkinCopy& c) {
+        for (uint32_t i = 0; i < c.pos.size(); ++i) at.try_emplace(c.pos[i], i);
+    }
+    uint32_t find(const UdimPos& p) const {
+        auto it = at.find(p);
+        return it == at.end() ? kNone : it->second;
+    }
+};
+
+UdimPos pos_of(MNMesh& m, int v) { return {m.P(v).x, m.P(v).y, m.P(v).z}; }
 
 INode* copy_bone(UdimSkinCopy& c, uint32_t i) {
     if (!c.bones[i] && !c.boneNames[i].empty()) c.bones[i] = GetCOREInterface()->GetINodeByName(c.boneNames[i].c_str());
@@ -550,9 +665,8 @@ uint32_t copy_bone_index(UdimSkinCopy& c, INode* node) {
     return (uint32_t)c.bones.size() - 1;
 }
 
-// Skin's weights of its vertex i against the copy's weights of input vertex v: the same bones,
-// each weight within `tolerance` (0 = identical). Skin normalizes what it is given, which can move
-// the last bit of a weight written back.
+// Skin's weights of its vertex i against copied vertex v: the same bones, each weight within
+// `tolerance` (0 = identical). Skin normalizes what it is given, which can move the last bit.
 bool skin_matches(const SkinAbove& s, int i, UdimSkinCopy& c, uint32_t v, float tolerance) {
     const int n = s.ctx->GetNumAssignedBones(i);
     if (n != (int)(c.first[v + 1] - c.first[v])) return false;
@@ -567,90 +681,99 @@ bool skin_matches(const SkinAbove& s, int i, UdimSkinCopy& c, uint32_t v, float 
     return true;
 }
 
-// Takes the weights of every input vertex while Skin still has them all.
-void capture(const SkinAbove& s, UdimSkinCopy& c) {
-    const int n = s.ctx->GetNumPoints();
-    c.first.assign(1, 0);
+// Appends Skin's weights of its vertex i as copied vertex at `p`.
+void copy_skin_vertex(const SkinAbove& s, int i, const UdimPos& p, UdimSkinCopy& c) {
+    if (c.first.empty()) c.first.push_back(0);
+    c.pos.push_back(p);
+    for (int k = 0; k < s.ctx->GetNumAssignedBones(i); ++k) {
+        c.bone.push_back(copy_bone_index(c, s.skin->GetBone(s.ctx->GetAssignedBone(i, k))));
+        c.weight.push_back(s.ctx->GetBoneWeight(i, k));
+    }
+    c.first.push_back((uint32_t)c.bone.size());
+}
+
+// Takes Skin's weights of every input vertex while Skin still has them all.
+void capture(const SkinAbove& s, MNMesh& input, UdimSkinCopy& c) {
+    c.pos.clear();
+    c.first.clear();
     c.bone.clear();
     c.weight.clear();
-    for (int v = 0; v < n; ++v) {
-        for (int k = 0; k < s.ctx->GetNumAssignedBones(v); ++k) {
-            c.bone.push_back(copy_bone_index(c, s.skin->GetBone(s.ctx->GetAssignedBone(v, k))));
-            c.weight.push_back(s.ctx->GetBoneWeight(v, k));
-        }
-        c.first.push_back((uint32_t)c.bone.size());
+    c.synced.clear();
+    for (int v = 0; v < input.VNum(); ++v) {
+        copy_skin_vertex(s, v, pos_of(input, v), c);
+        c.synced.push_back(c.pos.back());
     }
-    c.synced.resize(n);
-    for (int v = 0; v < n; ++v) c.synced[v] = (uint32_t)v;
     c.inSync = true;
 }
 
-// Before the vertex set changes: weights painted on the current vertices go into the copy.
-// Vertices Skin still has as copied (float noise aside) keep their copied values.
+// Before the vertex set changes: weights painted on the current vertices go into the copy
+// (vertices Skin still has as copied, float noise aside, keep their copied values).
 void fold_back(const SkinAbove& s, UdimSkinCopy& c) {
     if (!c.inSync || s.ctx->GetNumPoints() != (int)c.synced.size()) return;
-    std::vector<int> painted(c.first.size() - 1, -1);  // input vertex -> Skin vertex whose weights replace the copy
-    bool any = false;
-    for (size_t i = 0; i < c.synced.size(); ++i)
-        if (!skin_matches(s, (int)i, c, c.synced[i], 1e-6f)) {  // painted, not float noise
-            painted[c.synced[i]] = (int)i;
-            any = true;
-        }
-    if (!any) return;
+    const PosIndex index(c);
+    std::vector<int> painted(c.pos.size(), -1);  // copied vertex -> Skin vertex whose weights replace it
+    std::vector<int> added;                      // Skin vertices the copy does not have
+    for (size_t i = 0; i < c.synced.size(); ++i) {
+        const uint32_t v = index.find(c.synced[i]);
+        if (v == kNone) added.push_back((int)i);
+        else if (!skin_matches(s, (int)i, c, v, 1e-6f)) painted[v] = (int)i;
+    }
+    if (added.empty() && std::all_of(painted.begin(), painted.end(), [](int i) { return i < 0; })) return;
     UdimSkinCopy out = c;
-    out.first.assign(1, 0);
+    out.pos.clear();
+    out.first.clear();
     out.bone.clear();
     out.weight.clear();
-    for (size_t v = 0; v + 1 < c.first.size(); ++v) {
-        if (painted[v] < 0) {
-            out.bone.insert(out.bone.end(), c.bone.begin() + c.first[v], c.bone.begin() + c.first[v + 1]);
-            out.weight.insert(out.weight.end(), c.weight.begin() + c.first[v], c.weight.begin() + c.first[v + 1]);
-        } else {
-            const int i = painted[v];
-            for (int k = 0; k < s.ctx->GetNumAssignedBones(i); ++k) {
-                out.bone.push_back(copy_bone_index(out, s.skin->GetBone(s.ctx->GetAssignedBone(i, k))));
-                out.weight.push_back(s.ctx->GetBoneWeight(i, k));
-            }
+    for (size_t v = 0; v < c.pos.size(); ++v) {
+        if (painted[v] >= 0) {
+            copy_skin_vertex(s, painted[v], c.pos[v], out);
+            continue;
+        }
+        if (out.first.empty()) out.first.push_back(0);
+        out.pos.push_back(c.pos[v]);
+        for (uint32_t x = c.first[v]; x < c.first[v + 1]; ++x) {
+            out.bone.push_back(copy_bone_index(out, copy_bone(c, c.bone[x])));
+            out.weight.push_back(c.weight[x]);
         }
         out.first.push_back((uint32_t)out.bone.size());
     }
+    for (int i : added) copy_skin_vertex(s, i, c.synced[i], out);
     c = std::move(out);
 }
 
 std::wstring wide(const std::string& s) { return std::wstring(MSTR::FromUTF8(s.c_str()).data()); }
 
-bool unsubdivide_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, const UdimUnsubdivide& settings,
-                        UdimUnsubdivideState& st, std::wstring& status, INode*& nodeOut) {
+// The body of a reducing modifier's ModifyObject; `plan` makes a fresh plan when the cached one
+// does not match `signature`.
+template <class MakePlan>
+bool reduce_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, bool active, uint64_t signature, MakePlan&& plan,
+                   UdimReduceState& st, UdimIsReducer isReducer, std::wstring& status, INode*& nodeOut) {
     if (!node) node = node_of(self, &mc);
     nodeOut = node;
-    const SkinAbove skin = skin_above(node, self);
-    if (skin.ctx && st.skin.empty() && skin.ctx->GetNumPoints() == mesh.VNum()) capture(skin, st.skin);
+    const SkinAbove skin = skin_above(node, self, isReducer);
+    if (skin.ctx && skin.top && st.skin.empty() && skin.ctx->GetNumPoints() == mesh.VNum()) capture(skin, mesh, st.skin);
 
-    std::vector<uint32_t> current;
-    std::string report;
-    if (settings.levels > 0) {
-        if (st.plan.signature != unsubdivide_signature(mesh, settings)) unsubdivide_plan(mesh, settings, st.plan);
+    std::string report = "off";
+    if (active) {
+        if (st.plan.signature != signature) plan(st.plan);
         MNMesh result;
         if (apply_plan(mesh, st.plan, result)) {
             mesh = result;
-            current = st.plan.vertex;
             report = st.plan.report;
         } else {
             report = "the plan does not fit the input";
         }
-    } else {
-        report = "off";
     }
-    if (current.empty()) {  // the input goes through unchanged
-        current.resize(mesh.VNum());
-        for (int v = 0; v < mesh.VNum(); ++v) current[v] = (uint32_t)v;
-    }
+    std::vector<UdimPos> current(mesh.VNum());
+    for (int v = 0; v < mesh.VNum(); ++v) current[v] = pos_of(mesh, v);
 
     bool write = false;
-    if (skin.ctx) {
+    if (skin.ctx && !skin.top) {
+        report += "\nSkin weights: kept by the modifier above";
+    } else if (skin.ctx) {
         if (st.current != current && st.skin.inSync) fold_back(skin, st.skin);
         if (st.skin.empty()) {
-            report += "\nSkin weights: no copy (Skin had fewer vertices when the modifier was added)";
+            report += "\nSkin weights: no copy (Skin had other vertices when the modifier was added)";
         } else if (st.skin.inSync && st.skin.synced == current) {
             report += "\nSkin weights: exact";
         } else {
@@ -664,36 +787,53 @@ bool unsubdivide_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mes
     return write;
 }
 
-void unsubdivide_write_weights(INode* node, Modifier* self, UdimUnsubdivideState& st) {
-    if (!node || st.skin.empty()) return;
+bool unsubdivide_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, const UdimUnsubdivide& s, UdimReduceState& st,
+                        UdimIsReducer isReducer, std::wstring& status, INode*& nodeOut) {
+    return reduce_modify(self, mc, node, mesh, s.levels > 0, unsubdivide_signature(mesh, s),
+                         [&](UdimPlan& p) { unsubdivide_plan(mesh, s, p); }, st, isReducer, status, nodeOut);
+}
+
+bool decimate_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, const UdimDecimate& s, UdimReduceState& st,
+                     UdimIsReducer isReducer, std::wstring& status, INode*& nodeOut) {
+    return reduce_modify(self, mc, node, mesh, s.percent < 100, decimate_signature(mesh, s),
+                         [&](UdimPlan& p) { decimate_plan(mesh, s, p); }, st, isReducer, status, nodeOut);
+}
+
+bool write_weights(INode* node, Modifier* self, UdimReduceState& st, const std::vector<UdimSkinCopy*>& below) {
+    if (!node || st.skin.empty()) return false;
     node->EvalWorldState(GetCOREInterface()->GetTime());  // Skin remaps to the current vertices
-    const SkinAbove skin = skin_above(node, self);
+    const SkinAbove skin = skin_above(node, self, nullptr);
     auto* import = skin.mod ? static_cast<ISkinImportData*>(skin.mod->GetInterface(I_SKINIMPORTDATA)) : nullptr;
-    if (!skin.ctx || !import || skin.ctx->GetNumPoints() != (int)st.current.size()) return;
-    UdimSkinCopy& c = st.skin;
+    if (!skin.ctx || !import || skin.ctx->GetNumPoints() != (int)st.current.size()) return false;
+    const PosIndex own(st.skin);
+    std::vector<PosIndex> lower;
+    for (UdimSkinCopy* c : below) lower.emplace_back(*c);
     Tab<INode*> bones;
     Tab<float> weights;
     int written = 0;
     for (size_t i = 0; i < st.current.size(); ++i) {
-        const uint32_t v = st.current[i];
-        if (v + 1 >= c.first.size() || skin_matches(skin, (int)i, c, v, 0.0f)) continue;  // Skin still has it as copied
-        const int n = (int)(c.first[v + 1] - c.first[v]);
+        UdimSkinCopy* c = &st.skin;
+        uint32_t v = own.find(st.current[i]);
+        for (size_t k = 0; v == kNone && k < below.size(); ++k)
+            if ((v = lower[k].find(st.current[i])) != kNone) c = below[k];
+        if (v == kNone || skin_matches(skin, (int)i, *c, v, 0.0f)) continue;  // unknown, or Skin still has it as copied
+        const int n = (int)(c->first[v + 1] - c->first[v]);
         bones.SetCount(n);
         weights.SetCount(n);
         for (int k = 0; k < n; ++k) {
-            bones[k] = copy_bone(c, c.bone[c.first[v] + k]);
-            weights[k] = c.weight[c.first[v] + k];
+            bones[k] = copy_bone(*c, c->bone[c->first[v] + k]);
+            weights[k] = c->weight[c->first[v] + k];
         }
         import->AddWeights(node, (int)i, bones, weights);
         ++written;
     }
-    c.synced = st.current;
-    c.inSync = true;
+    st.skin.synced = st.current;
+    st.skin.inSync = true;
     if (written) skin.mod->NotifyDependents(FOREVER, PART_GEOM, REFMSG_CHANGE);
+    return true;
 }
 
-const UdimCoreApi kApi{kUdimCoreApiVersion, kBuild, inspect, unsubdivide_signature, unsubdivide_plan, apply_plan,
-                       unsubdivide_modify, unsubdivide_write_weights};
+const UdimCoreApi kApi{kUdimCoreApiVersion, kBuild, inspect, unsubdivide_modify, decimate_modify, write_weights};
 
 }  // namespace
 
