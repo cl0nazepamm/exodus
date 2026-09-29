@@ -4,7 +4,7 @@
 
 LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 
-IDD_UNSUBDIVIDE DIALOGEX 0, 0, 108, 70
+IDD_UNSUBDIVIDE DIALOGEX 0, 0, 108, 84
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "MS Sans Serif", 0, 0, 0x0
 BEGIN
@@ -12,7 +12,8 @@ BEGIN
     CONTROL         "", IDC_LEVELS_EDIT, "CustEdit", WS_TABSTOP, 40, 6, 26, 10
     CONTROL         "", IDC_LEVELS_SPIN, "SpinnerControl", 0x0, 67, 6, 7, 10
     CONTROL         "Symmetry", IDC_SYMMETRY, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 6, 22, 70, 10
-    LTEXT           "", IDC_STATUS, 6, 38, 96, 28
+    CONTROL         "Quad dominant", IDC_QUAD_DOMINANT, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 6, 35, 90, 10
+    LTEXT           "", IDC_STATUS, 6, 52, 96, 28
 END
 
 IDD_DECIMATE DIALOGEX 0, 0, 108, 70
@@ -118,4 +119,5 @@ BEGIN
     IDS_MAP_FILES "Map files"
     IDS_ASSIGN_MAP "Assign map"
     IDS_CHOOSE_OUT_DIR "Atlas output folder"
+    IDS_QUAD_DOMINANT "Quad dominant"
 END

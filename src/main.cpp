@@ -41,9 +41,11 @@ static void usage() {
         "  --fill <channel>[:<glob>]=r,g,b[,a]\n"
         "                                value (0-255) for islands whose material lacks this map\n"
         "  --unsubdivide N               reverse N Catmull-Clark subdivision levels (before decimation);\n"
-        "                                exact where the mesh is a subdivision result, otherwise quads are\n"
-        "                                grouped into blocks of about four (mostly quads out, few triangles);\n"
+        "                                exact where the mesh is a subdivision result, otherwise every\n"
+        "                                other vertex is dissolved twice per level (Blender's un-subdivide);\n"
         "                                vertices keep their positions, UVs and normals (seams stay seams)\n"
+        "  --quad-dominant               with --unsubdivide: group quads into blocks of about four instead\n"
+        "                                (mostly quads out; reduces more on the second level)\n"
         "  --unsubdivide-exact           refuse meshes that are not a subdivision result instead\n"
         "  --no-symmetry                 with --unsubdivide: do not keep mirror-symmetric meshes symmetric\n"
         "  --cage                        with --unsubdivide: recover the control cage positions\n"
@@ -105,6 +107,7 @@ static bool parse_args(int argc, char** argv, PackOptions& o) {
         else if (a == "--cage") o.cage = true;
         else if (a == "--unsubdivide-exact") o.unsubExact = true;
         else if (a == "--no-symmetry") o.noSymmetry = true;
+        else if (a == "--quad-dominant") o.quadDominant = true;
         else if (a == "--subdivide") o.subdivide = std::stoi(next());
         else if (a == "--tris") o.tris = std::stoull(next());
         else if (a == "--decimate") {

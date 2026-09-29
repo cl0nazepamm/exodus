@@ -797,6 +797,491 @@ std::vector<uint32_t> find_mirror(const InMesh& m, int& axisOut) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// Approximate reverse subdivision for meshes that are not a subdivision result: Blender's
+// un-subdivide (source/blender/bmesh/tools/bmesh_decimate_unsubdivide.cc), extended for per-corner
+// data. A flood fill over edges colours the vertices like a checkerboard and every other one is
+// dissolved: each face around it gives up that corner (the ear it sheds) and the ears join into one
+// polygon of its neighbours. One pass halves the vertices in a diamond pattern; two passes are one
+// reverse subdivision step on a regular grid. Nothing moves and nothing is interpolated: every
+// surviving corner keeps its position, UV and normal. Vertices that cannot go (valence 5 and up,
+// non-manifold fans, locked materials) take no part in the fill; where the pattern does not fit
+// around them, triangles appear. Two additions to Blender: the fill picks its colours so those
+// vertices stay, and afterwards triangle pairs that make a good quad are joined, as Blender's
+// Tris to Quads does.
+//
+// Blender dissolves a vertex on the mesh border as the fan of its one side. A UV seam, hard normal
+// edge or material border through a vertex is treated the same way here: each side is dissolved on
+// its own, so the seam stays an edge and is halved like everything else.
+//
+// With `symmetric`, a mesh with a mirror (see find_mirror) stays symmetric: the fill colours a
+// vertex and its mirror image alike, a vertex is dissolved only together with its image (the
+// first is undone when the second cannot follow), and triangle pairs join only with their image.
+
+struct DissolveResult {
+    size_t passes = 0, dissolved = 0, joined = 0;
+    std::string stop;     // why a pass found nothing to dissolve (empty = both passes did work)
+    int axis = -1;        // mirror axis (-1 = none)
+    double mirrored = 0;  // share of the vertices with a mirror image
+    size_t unpaired = 0;  // dissolves and joins left out because the mirror side could not follow
+};
+
+DissolveResult dissolve_level(InMesh& m, const std::vector<uint8_t>& lockedMaterial, bool symmetric) {
+    struct Corner { uint32_t pos, uv, nrm, src; };
+    struct Face { std::vector<Corner> c; uint32_t material = 0; bool dead = false; };
+    const bool hasN = !m.cornerNrm.empty(), hasSrc = !m.cornerSrc.empty();
+    const uint32_t nv = (uint32_t)m.positions.size();
+    DissolveResult res;
+    const std::vector<uint32_t> mir = symmetric ? find_mirror(m, res.axis) : std::vector<uint32_t>(nv, kNone);
+    std::vector<Face> faces(m.faces.size());
+    std::vector<std::vector<uint32_t>> vertFaces(nv);  // live faces per position
+    for (uint32_t f = 0; f < m.faces.size(); ++f) {
+        faces[f].material = m.faces[f].material;
+        for (uint32_t c = m.faces[f].first; c < m.faces[f].first + m.faces[f].count; ++c) {
+            faces[f].c.push_back({m.cornerPos[c], m.cornerUv[c], hasN ? m.cornerNrm[c] : 0, hasSrc ? m.cornerSrc[c] : 0});
+            vertFaces[m.cornerPos[c]].push_back(f);
+        }
+    }
+
+    // One face around a vertex: its corner there, the neighbours before and after it, and the face
+    // across the edge to `next` (which runs the other way there).
+    struct Wedge { uint32_t face, corner, prev, next, succ; bool pred; };
+    std::vector<Wedge> wedges, ring;              // ring: the faces around the vertex in order
+    std::vector<std::vector<Corner>> polys;       // the polygons the ears join into, one per side
+    std::vector<uint32_t> polyMat;
+    std::vector<std::vector<uint32_t>> newFaces;  // positions of every face the dissolve leaves behind
+    auto corner_at = [&](const Wedge& w, int d) -> const Corner& {
+        const std::vector<Corner>& c = faces[w.face].c;
+        return c[(w.corner + c.size() + d) % c.size()];
+    };
+    auto locked = [&](uint32_t mat) { return mat < lockedMaterial.size() && lockedMaterial[mat]; };
+
+    // Can `v` be dissolved: an interior vertex of valence 2-4 (Blender: 3-4 as a fan, 2 as a chain,
+    // which the fan covers) or a border vertex of valence 3, with at most two cuts. `full` also
+    // builds the result and checks it is a clean manifold without duplicate faces; the surroundings
+    // change as neighbours dissolve, so, as in Blender, the fill only uses the topology test.
+    auto plan = [&](uint32_t v, bool full) {
+        const std::vector<uint32_t>& fs = vertFaces[v];
+        const size_t k = fs.size();
+        if (k < 2 || k > 4) return false;
+        wedges.resize(k);
+        for (size_t i = 0; i < k; ++i) {
+            const Face& F = faces[fs[i]];
+            if (locked(F.material)) return false;
+            const uint32_t n = (uint32_t)F.c.size();
+            uint32_t at = kNone;
+            for (uint32_t j = 0; j < n; ++j)
+                if (F.c[j].pos == v) {
+                    if (at != kNone) return false;
+                    at = j;
+                }
+            wedges[i] = {fs[i], at, F.c[(at + n - 1) % n].pos, F.c[(at + 1) % n].pos, kNone, false};
+            if (wedges[i].prev == wedges[i].next) return false;
+        }
+        for (size_t i = 0; i < k; ++i)
+            for (size_t j = 0; j < k; ++j) {
+                if (j == i) continue;
+                if (wedges[j].next == wedges[i].next || wedges[j].prev == wedges[i].prev) return false;  // non-manifold or flipped
+                if (wedges[j].prev == wedges[i].next) { wedges[i].succ = (uint32_t)j; wedges[j].pred = true; }
+            }
+        size_t start = 0, starts = 0;
+        for (size_t i = 0; i < k; ++i)
+            if (!wedges[i].pred) { start = i; ++starts; }
+        const bool closed = starts == 0;
+        if (!closed && (starts != 1 || k != 2)) return false;
+        ring.clear();
+        for (size_t i = start;;) {
+            for (const Wedge& w : ring)
+                if (w.face == wedges[i].face) return false;
+            ring.push_back(wedges[i]);
+            if (ring.size() == k) break;
+            if (wedges[i].succ == kNone) return false;
+            i = wedges[i].succ;
+        }
+        if (closed ? ring.back().succ != start : ring.back().succ != kNone) return false;
+
+        // cuts: a UV seam, hard normal edge or material border between two faces of the ring
+        auto cut = [&](const Wedge& a, const Wedge& b) {  // b follows a across the edge to a.next
+            const Corner &an = corner_at(a, 1), &bp = corner_at(b, -1), &av = corner_at(a, 0), &bv = corner_at(b, 0);
+            return faces[a.face].material != faces[b.face].material || an.uv != bp.uv || an.nrm != bp.nrm ||
+                   av.uv != bv.uv || av.nrm != bv.nrm;
+        };
+        size_t cutAt[2] = {0, 0}, cuts = 0;  // cutAt: first face of a side
+        for (size_t i = 0; i + (closed ? 0 : 1) < k; ++i)
+            if (cut(ring[i], ring[(i + 1) % k])) {
+                if (!closed || cuts == 2) return false;
+                cutAt[cuts++] = (i + 1) % k;
+            }
+        if (cuts == 1) return false;
+        if (!full) return true;
+
+        // the polygon of one side: its neighbours, winding opposite to the ears it replaces
+        polys.clear();
+        polyMat.clear();
+        auto side = [&](size_t b, size_t len, bool wrap) {
+            std::vector<Corner> p;
+            if (!wrap) p.push_back(corner_at(ring[(b + len - 1) % k], 1));
+            for (size_t s = len; s-- > 0;) p.push_back(corner_at(ring[(b + s) % k], -1));
+            if (p.size() < 3) return;  // a single face: giving up the corner is all there is to do
+            polys.push_back(std::move(p));
+            polyMat.push_back(faces[ring[b].face].material);
+        };
+        if (!closed) side(0, k, false);
+        else if (!cuts) side(0, k, true);
+        else {
+            const size_t len = (cutAt[1] + k - cutAt[0]) % k;
+            side(cutAt[0], len, false);
+            side(cutAt[1], k - len, false);
+        }
+
+        // what is left behind: every face of the ring minus its corner at v (a triangle goes), and
+        // the polygons. Each new edge may be used once per direction, twice in all, and no face
+        // may repeat another one.
+        newFaces.clear();
+        for (const Wedge& w : ring) {
+            const std::vector<Corner>& c = faces[w.face].c;
+            if (c.size() <= 3) continue;
+            newFaces.emplace_back();
+            for (uint32_t j = 0; j < c.size(); ++j)
+                if (j != w.corner) newFaces.back().push_back(c[j].pos);
+        }
+        for (const std::vector<Corner>& p : polys) {
+            newFaces.emplace_back();
+            for (const Corner& c : p) newFaces.back().push_back(c.pos);
+        }
+        auto in_ring = [&](uint32_t f) {
+            for (const Wedge& w : ring)
+                if (w.face == f) return true;
+            return false;
+        };
+        auto count_edge = [](const auto& verts, uint32_t a, uint32_t b, size_t& same, size_t& opp) {
+            for (size_t j = 0; j < verts.size(); ++j) {
+                const uint32_t x = verts[j], y = verts[(j + 1) % verts.size()];
+                same += x == a && y == b;
+                opp += x == b && y == a;
+            }
+        };
+        auto same_set = [](std::vector<uint32_t> x, std::vector<uint32_t> y) {
+            if (x.size() != y.size()) return false;
+            std::sort(x.begin(), x.end());
+            std::sort(y.begin(), y.end());
+            return x == y;
+        };
+        std::vector<uint32_t> ext;
+        for (size_t i = 0; i < newFaces.size(); ++i) {
+            const std::vector<uint32_t>& F = newFaces[i];
+            for (size_t a = 0; a < F.size(); ++a)
+                for (size_t b = a + 1; b < F.size(); ++b)
+                    if (F[a] == F[b]) return false;
+            for (size_t j = 0; j < F.size(); ++j) {
+                const uint32_t a = F[j], b = F[(j + 1) % F.size()];
+                size_t same = 0, opp = 0;
+                for (uint32_t g : vertFaces[a]) {
+                    if (in_ring(g)) continue;
+                    ext.clear();
+                    for (const Corner& c : faces[g].c) ext.push_back(c.pos);
+                    count_edge(ext, a, b, same, opp);
+                }
+                for (size_t o = 0; o < newFaces.size(); ++o)
+                    if (o != i) count_edge(newFaces[o], a, b, same, opp);
+                if (same || opp > 1) return false;
+            }
+            for (uint32_t g : vertFaces[F[0]]) {
+                if (in_ring(g)) continue;
+                ext.clear();
+                for (const Corner& c : faces[g].c) ext.push_back(c.pos);
+                if (same_set(ext, F)) return false;
+            }
+            for (size_t o = i + 1; o < newFaces.size(); ++o)
+                if (same_set(newFaces[o], F)) return false;
+        }
+        return true;
+    };
+
+    // Dissolve `v` as planned: the ring faces give up their corner at v, the polygons join in. With
+    // `u`, what it changes is saved first so `restore` can put it back.
+    struct Undo {
+        size_t faceCount = 0;
+        std::vector<std::pair<uint32_t, Face>> faces;
+        std::vector<std::pair<uint32_t, std::vector<uint32_t>>> vertFaces;
+    } undo;
+    auto dissolve = [&](uint32_t v, Undo* u) {
+        if (u) {
+            u->faceCount = faces.size();
+            u->faces.clear();
+            u->vertFaces.clear();
+            for (const Wedge& w : ring) {
+                u->faces.push_back({w.face, faces[w.face]});
+                for (const Corner& c : faces[w.face].c) {
+                    bool saved = false;
+                    for (const auto& [x, list] : u->vertFaces) saved |= x == c.pos;
+                    if (!saved) u->vertFaces.push_back({c.pos, vertFaces[c.pos]});
+                }
+            }
+        }
+        for (const Wedge& w : ring) {
+            Face& F = faces[w.face];
+            if (F.c.size() > 3) {
+                F.c.erase(F.c.begin() + w.corner);
+                continue;
+            }
+            F.dead = true;
+            for (const Corner& c : F.c) {
+                if (c.pos == v) continue;
+                std::vector<uint32_t>& vf = vertFaces[c.pos];
+                vf.erase(std::find(vf.begin(), vf.end(), w.face));
+            }
+        }
+        vertFaces[v].clear();
+        for (size_t i = 0; i < polys.size(); ++i) {
+            const uint32_t id = (uint32_t)faces.size();
+            faces.push_back({std::move(polys[i]), polyMat[i]});
+            for (const Corner& c : faces[id].c) vertFaces[c.pos].push_back(id);
+        }
+    };
+    auto restore = [&](Undo& u) {
+        for (auto& [f, F] : u.faces) faces[f] = std::move(F);
+        faces.resize(u.faceCount);
+        for (auto& [v, list] : u.vertFaces) vertFaces[v] = std::move(list);
+    };
+
+    // Two passes of Blender's fill: a flood fill over the vertices that can go colours them in
+    // alternation, and one colour is dissolved. Blender dissolves the colour its seed does not
+    // have. Here each region of the fill dissolves the colour that keeps the vertices around it
+    // that cannot go (poles, seam junctions, border corners), as a real subdivision would: its
+    // extraordinary vertices are always original ones. A pole on the dissolved colour stays behind
+    // with a fan of triangles around it.
+    std::vector<uint8_t> can(nv), parity(nv), marked(nv);
+    std::vector<uint32_t> region(nv), queue, nb;
+    std::vector<std::array<size_t, 2>> votes;  // per region and colour: edges to vertices that cannot go
+    auto neighbours = [&](uint32_t v) {
+        nb.clear();
+        for (uint32_t f : vertFaces[v]) {
+            const std::vector<Corner>& c = faces[f].c;
+            for (size_t j = 0; j < c.size(); ++j)
+                if (c[j].pos == v) {
+                    nb.push_back(c[(j + c.size() - 1) % c.size()].pos);
+                    nb.push_back(c[(j + 1) % c.size()].pos);
+                }
+        }
+        std::sort(nb.begin(), nb.end());
+        nb.erase(std::unique(nb.begin(), nb.end()), nb.end());
+    };
+    {
+        size_t used = 0, paired = 0;
+        for (uint32_t v = 0; v < nv; ++v) {
+            used += !vertFaces[v].empty();
+            paired += !vertFaces[v].empty() && mir[v] != kNone;
+        }
+        res.mirrored = used ? (double)paired / (double)used : 0.0;
+    }
+    // a vertex and its mirror image get the same region and colour
+    auto assign = [&](uint32_t u, uint32_t r, uint8_t par) {
+        for (uint32_t x : {u, mir[u]}) {
+            if (x == kNone || !can[x] || region[x] != kNone) continue;
+            region[x] = r;
+            parity[x] = par;
+            queue.push_back(x);
+        }
+    };
+    for (int pass = 0; pass < 2; ++pass) {
+        for (uint32_t v = 0; v < nv; ++v) {
+            can[v] = plan(v, false);
+            region[v] = kNone;
+        }
+        votes.clear();
+        for (uint32_t s = 0; s < nv; ++s) {
+            if (!can[s] || region[s] != kNone) continue;
+            const uint32_t r = (uint32_t)votes.size();
+            votes.push_back({0, 0});
+            queue.clear();
+            assign(s, r, 0);
+            for (size_t qi = 0; qi < queue.size(); ++qi) {
+                const uint32_t v = queue[qi];
+                neighbours(v);
+                for (uint32_t u : nb) {
+                    if (!can[u]) {
+                        if (!vertFaces[u].empty()) ++votes[r][parity[v]];  // u stays if v goes
+                    } else if (region[u] == kNone) {
+                        assign(u, r, parity[v] ^ 1);
+                    }
+                }
+            }
+        }
+        bool any = false;
+        for (uint32_t v = 0; v < nv; ++v) {
+            marked[v] = 0;
+            if (!can[v]) continue;
+            const std::array<size_t, 2>& vt = votes[region[v]];
+            const uint8_t go = vt[0] > vt[1] ? 0 : 1;  // a tie: Blender's choice
+            marked[v] = parity[v] == go;
+            const uint32_t w = mir[v];  // both sides go or neither, and never a vertex next to its own image
+            if (marked[v] && w != kNone && w != v) {
+                neighbours(v);
+                marked[v] = can[w] && parity[w] == parity[v] && !std::binary_search(nb.begin(), nb.end(), w);
+            }
+            any |= marked[v] != 0;
+        }
+        if (!any) {
+            res.stop = "no vertex can be dissolved";
+            break;
+        }
+        for (uint32_t v = 0; v < nv; ++v) {
+            if (!marked[v]) continue;
+            const uint32_t w = mir[v];
+            if (w == kNone || w == v) {
+                if (plan(v, true)) {
+                    dissolve(v, nullptr);
+                    ++res.dissolved;
+                }
+                continue;
+            }
+            if (w < v || !plan(v, true)) continue;  // a pair goes when its first vertex comes up
+            dissolve(v, &undo);
+            if (plan(w, true)) {
+                dissolve(w, nullptr);
+                res.dissolved += 2;
+            } else {
+                restore(undo);
+                ++res.unpaired;
+            }
+        }
+        ++res.passes;
+    }
+
+    // Blender's Tris to Quads (source/blender/bmesh/operators/bmo_join_triangles.cc) on what the
+    // level leaves: triangle pairs that make a good quad are joined, best first by Blender's error
+    // (bend + corners off a right angle + concavity). With its default limits the two halves may
+    // bend by at most 40 degrees and no corner may be more than 40 degrees off a right angle; a
+    // concave quad never joins, and neither does a pair across a seam, hard edge or material border.
+    auto sub = [](const Vec3d& a, const Vec3d& b) { return Vec3d{a[0] - b[0], a[1] - b[1], a[2] - b[2]}; };
+    auto dot = [](const Vec3d& a, const Vec3d& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    auto cross = [](const Vec3d& a, const Vec3d& b) {
+        return Vec3d{a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+    };
+    auto angle = [&](const Vec3d& a, const Vec3d& b) {
+        const double l = std::sqrt(dot(a, a) * dot(b, b));
+        return l > 0 ? std::acos(std::clamp(dot(a, b) / l, -1.0, 1.0)) : 0.0;
+    };
+    auto normal = [&](uint32_t a, uint32_t b, uint32_t c) {
+        return cross(sub(m.positions[b], m.positions[a]), sub(m.positions[c], m.positions[a]));
+    };
+    auto area = [&](uint32_t a, uint32_t b, uint32_t c) { const Vec3d n = normal(a, b, c); return 0.5 * std::sqrt(dot(n, n)); };
+    constexpr double kPi = 3.14159265358979323846, kJoinLimit = 40.0 * kPi / 180.0;
+    struct Join { double error; uint32_t t, g, at, gt; };  // triangles t and g, corners of the shared edge
+    std::vector<Join> joins;
+    for (uint32_t t = 0; t < faces.size() && res.passes; ++t) {
+        const Face& T = faces[t];
+        if (T.dead || T.c.size() != 3 || locked(T.material)) continue;
+        for (uint32_t j = 0; j < 3; ++j) {
+            const Corner &ca = T.c[j], &cb = T.c[(j + 1) % 3], &cc = T.c[(j + 2) % 3];
+            uint32_t g = kNone, gt = 0, users = 0;  // the other face on edge a -> b, which runs b -> a
+            for (uint32_t h : vertFaces[ca.pos]) {
+                if (h == t) continue;
+                const std::vector<Corner>& c = faces[h].c;
+                for (uint32_t k = 0; k < c.size(); ++k) {
+                    const uint32_t x = c[k].pos, y = c[(k + 1) % c.size()].pos;
+                    if (x == cb.pos && y == ca.pos) { g = h; gt = k; ++users; }
+                    else if (x == ca.pos && y == cb.pos) ++users;
+                }
+            }
+            if (users != 1 || g < t) continue;  // each pair once
+            const Face& G = faces[g];
+            if (G.c.size() != 3 || G.material != T.material) continue;
+            const Corner &gb = G.c[gt], &ga = G.c[(gt + 1) % 3], &gd = G.c[(gt + 2) % 3];
+            if (ga.uv != ca.uv || gb.uv != cb.uv || ga.nrm != ca.nrm || gb.nrm != cb.nrm || gd.pos == cc.pos) continue;
+            // the quad (a, d, b, c) in the triangles' winding
+            const uint32_t q[4] = {ca.pos, gd.pos, cb.pos, cc.pos};
+            if (angle(normal(ca.pos, cb.pos, cc.pos), normal(cb.pos, ca.pos, gd.pos)) > kJoinLimit) continue;
+            if (dot(normal(q[0], q[1], q[2]), normal(q[0], q[2], q[3])) <= 0 ||
+                dot(normal(q[1], q[2], q[3]), normal(q[1], q[3], q[0])) <= 0) continue;  // concave or folded
+            Vec3d e[4];
+            for (int i = 0; i < 4; ++i) e[i] = sub(m.positions[q[i]], m.positions[q[(i + 1) % 4]]);
+            double corners = 0, worst = 0;
+            for (int i = 0; i < 4; ++i) {
+                const double off = std::abs(angle(e[i], e[(i + 1) % 4]) - kPi / 2);
+                corners += off;
+                worst = std::max(worst, off);
+            }
+            if (worst > kJoinLimit) continue;
+            const double bend = (angle(normal(q[0], q[1], q[2]), normal(q[0], q[2], q[3])) +
+                                 angle(normal(q[1], q[2], q[3]), normal(q[3], q[0], q[1]))) / (2 * kPi);
+            const double a0 = area(q[0], q[1], q[2]) + area(q[0], q[2], q[3]);
+            const double a1 = area(q[1], q[2], q[3]) + area(q[3], q[0], q[1]);
+            const double concave = std::max(a0, a1) > 0 ? 1.0 - std::min(a0, a1) / std::max(a0, a1) : 1.0;
+            joins.push_back({bend + corners / (2 * kPi) + concave, t, g, j, gt});
+        }
+    }
+    std::sort(joins.begin(), joins.end(), [](const Join& x, const Join& y) { return x.error < y.error; });
+    auto triangle = [&](uint32_t f) { return f != kNone && !faces[f].dead && faces[f].c.size() == 3; };
+    auto corner_of = [&](uint32_t f, uint32_t v) {  // the corner of v in face f, or kNone
+        for (uint32_t k = 0; k < faces[f].c.size(); ++k)
+            if (faces[f].c[k].pos == v) return k;
+        return kNone;
+    };
+    auto mirror_tri = [&](uint32_t f) {  // the live triangle on the mirror images of f's corners
+        uint32_t mv[3];
+        for (int k = 0; k < 3; ++k)
+            if ((mv[k] = mir[faces[f].c[k].pos]) == kNone) return kNone;
+        for (uint32_t h : vertFaces[mv[0]])
+            if (triangle(h) && corner_of(h, mv[1]) != kNone && corner_of(h, mv[2]) != kNone) return h;
+        return kNone;
+    };
+    auto join = [&](uint32_t t, uint32_t at, uint32_t g, uint32_t gt) {  // g runs t's edge at -> at + 1 backwards
+        Face& T = faces[t];
+        const Corner a = T.c[at], b = T.c[(at + 1) % 3], c = T.c[(at + 2) % 3], d = faces[g].c[(gt + 2) % 3];
+        T.c = {a, d, b, c};
+        faces[g].dead = true;
+        for (const Corner& x : faces[g].c) {
+            std::vector<uint32_t>& vf = vertFaces[x.pos];
+            vf.erase(std::find(vf.begin(), vf.end(), g));
+        }
+        vertFaces[d.pos].push_back(t);
+        ++res.joined;
+    };
+    for (const Join& J : joins) {
+        if (!triangle(J.t) || !triangle(J.g)) continue;  // one of them already joined
+        const uint32_t a = faces[J.t].c[J.at].pos, b = faces[J.t].c[(J.at + 1) % 3].pos;
+        bool alone = true;  // no mirror here: nothing to keep symmetric
+        for (const uint32_t f : {J.t, J.g})
+            for (const Corner& c : faces[f].c) alone &= mir[c.pos] == kNone;
+        const uint32_t mt = alone ? kNone : mirror_tri(J.t), mg = alone ? kNone : mirror_tri(J.g);
+        if (alone || (mt == J.t && mg == J.g) || (mt == J.g && mg == J.t)) {  // no mirror, or its own mirror
+            join(J.t, J.at, J.g, J.gt);
+            continue;
+        }
+        // the mirror pair runs the shared edge the other way: mt from mir[b] to mir[a], mg back
+        const uint32_t mat = mt == kNone ? kNone : corner_of(mt, mir[b]), mgt = mg == kNone ? kNone : corner_of(mg, mir[a]);
+        if (mat == kNone || mgt == kNone || mt == J.t || mt == J.g || mg == J.t || mg == J.g ||
+            faces[mt].c[(mat + 1) % 3].pos != mir[a] || faces[mg].c[(mgt + 1) % 3].pos != mir[b]) {
+            ++res.unpaired;
+            continue;
+        }
+        join(J.t, J.at, J.g, J.gt);
+        join(mt, mat, mg, mgt);
+    }
+
+    InMesh out;
+    out.name = m.name;
+    out.positions = std::move(m.positions);
+    out.normals = std::move(m.normals);
+    out.uvs = std::move(m.uvs);
+    for (const Face& F : faces) {
+        if (F.dead) continue;
+        out.faces.push_back({(uint32_t)out.cornerPos.size(), (uint32_t)F.c.size(), F.material});
+        for (const Corner& c : F.c) {
+            out.cornerPos.push_back(c.pos);
+            out.cornerUv.push_back(c.uv);
+            if (hasN) out.cornerNrm.push_back(c.nrm);
+            if (hasSrc) out.cornerSrc.push_back(c.src);
+        }
+    }
+    compact(out);
+    triangulate(out);
+    m = std::move(out);
+    return res;
+}
+
+// ------------------------------------------------------------------------------------------------
 // Coarsening: the approximate reverse of one subdivision level, for meshes that are not a
 // subdivision result (an artist's cage, or a level below it). Only input vertices are kept, at
 // their input positions, and every corner keeps an input corner's UV and normal.
@@ -1870,16 +2355,29 @@ SubdivReport unsubdivide_scene(InScene& scene, const UnsubdivideOptions& opt) {
             rep.materialMismatch += R.materialMismatch;
             if (R.cfFirst.size() == 1) {  // nothing reversed exactly at this level
                 if (opt.exactOnly || m.faces.empty()) break;
-                const CoarsenResult d = coarsen_level(m, opt.keep, opt.symmetry);
-                mr.stop = d.stop;
-                if (!d.stop.empty()) break;
-                mr.removed += d.removed;
-                mr.paired += d.paired;
-                mr.triangles = d.triangles;
-                mr.unpaired += d.unpaired;
-                mr.mirrorAxis = d.axis;
-                mr.mirrored = d.mirrored;
-                ++mr.approxLevels;
+                if (opt.quadDominant) {
+                    const CoarsenResult d = coarsen_level(m, opt.keep, opt.symmetry);
+                    mr.stop = d.stop;
+                    if (!d.stop.empty()) break;
+                    mr.removed += d.removed;
+                    mr.paired += d.paired;
+                    mr.unpaired += d.unpaired;
+                    mr.mirrorAxis = d.axis;
+                    mr.mirrored = d.mirrored;
+                    ++mr.approxLevels;
+                } else {
+                    const DissolveResult d = dissolve_level(m, opt.keep, opt.symmetry);
+                    mr.removed += d.dissolved;
+                    mr.paired += 2 * d.joined;
+                    mr.unpaired += d.unpaired;
+                    mr.mirrorAxis = d.axis;
+                    mr.mirrored = d.mirrored;
+                    mr.stop = d.stop;
+                    if (d.passes) ++mr.approxLevels;
+                    if (!d.stop.empty()) break;
+                }
+                mr.triangles = 0;
+                for (const InFace& f : m.faces) mr.triangles += f.count == 3;
                 continue;
             }
             if (opt.solveCage) {

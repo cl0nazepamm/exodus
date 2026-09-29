@@ -45,6 +45,7 @@ struct PackOptions {
     bool cage = false;      // recover the control cage positions instead of keeping the smoothed ones
     bool unsubExact = false;  // refuse meshes that are not a subdivision result instead of coarsening them
     bool noSymmetry = false;  // let coarsening break the symmetry of mirror-symmetric meshes
+    bool quadDominant = false;  // approximate levels by grouping quads into blocks (mostly quads, stronger)
     int subdivide = 0;      // Catmull-Clark levels to apply (utility / round-trip testing)
 };
 

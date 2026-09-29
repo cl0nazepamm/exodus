@@ -407,6 +407,7 @@ uint64_t unsubdivide_signature(MNMesh& m, const ExodusUnsubdivide& s) {
     Fnv h = settings_hash('U');
     h.add((uint64_t)s.levels);
     h.add(s.symmetry);
+    h.add(s.quadDominant);
     return topology_hash(m, h);
 }
 
@@ -419,6 +420,7 @@ bool unsubdivide_plan(MNMesh& m, const ExodusUnsubdivide& s, ExodusPlan& plan) {
     UnsubdivideOptions opt;
     opt.levels = s.levels;
     opt.symmetry = s.symmetry;
+    opt.quadDominant = s.quadDominant;
     const SubdivReport rep = unsubdivide_scene(scene, opt);
     if (!finish_plan(m, ct, scene.meshes[0], plan)) return false;
 

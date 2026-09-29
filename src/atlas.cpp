@@ -219,6 +219,7 @@ void Packer::subdivision() {
         u.solveCage = o.cage;
         u.exactOnly = o.unsubExact;
         u.symmetry = !o.noSymmetry;
+        u.quadDominant = o.quadDominant;
         u.keep.assign(scene.materials.size(), 0);
         for (const std::string& g : o.noDecimate)
             for (size_t i = 0; i < scene.materials.size(); ++i)
@@ -229,8 +230,8 @@ void Packer::subdivision() {
             say("  %-40s faces %7zu -> %7zu ", m.name.c_str(), m.facesBefore, m.facesAfter);
             if (m.levels) say(" %d exact", m.levels);
             if (m.approxLevels)
-                say(" %d approx (%zu vertices removed, %zu odd faces paired into quads, %zu triangles left)", m.approxLevels,
-                    m.removed, m.paired, m.triangles);
+                say(" %d approx%s (%zu vertices removed, %zu odd faces paired into quads, %zu triangles left)", m.approxLevels,
+                    o.quadDominant ? " quad-dominant" : "", m.removed, m.paired, m.triangles);
             if (m.approxLevels && m.mirrorAxis >= 0)
                 say(" mirror %c on %.1f%% of the vertices (%zu left out to stay symmetric)", "xyz"[m.mirrorAxis],
                     m.mirrored * 100, m.unpaired);
@@ -840,9 +841,10 @@ void Packer::write_manifest(const std::vector<std::string>& files) {
     std::fprintf(f, "{\n  \"input\": %s,\n  \"atlas\": {\"width\": %d, \"height\": %d, \"padding\": %d},\n",
                  json_str(scene.sourcePath).c_str(), AW, AH, o.padding);
     if (unsubdivided) {
-        std::fprintf(f, "  \"unsubdivide\": {\"levels\": %d, \"cage\": %s, \"faces_in\": %zu, \"faces_out\": %zu, "
+        std::fprintf(f, "  \"unsubdivide\": {\"levels\": %d, \"quad_dominant\": %s, \"cage\": %s, \"faces_in\": %zu, \"faces_out\": %zu, "
                         "\"triangles_in\": %zu, \"triangles_out\": %zu, \"fit_rms\": %.6g, \"fit_max\": %.6g, \"meshes\": [",
-                     o.unsubdivide, o.cage ? "true" : "false", sub.facesBefore, sub.facesAfter, sub.trisBefore, sub.trisAfter,
+                     o.unsubdivide, o.quadDominant ? "true" : "false", o.cage ? "true" : "false", sub.facesBefore, sub.facesAfter,
+                     sub.trisBefore, sub.trisAfter,
                      sub.fitRms, sub.fitMax);
         for (size_t i = 0; i < sub.meshes.size(); ++i) {
             const SubdivReport::Mesh& m = sub.meshes[i];

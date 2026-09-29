@@ -19,7 +19,7 @@ const Class_ID kUnsubdivideClassId(0xb3ea3d05, 0x9f0b4206);
 const Class_ID kDecimateClassId(0x14524858, 0xf249c598);
 
 enum { kParams };
-enum { kLevels, kSymmetry };        // Unsubdivide
+enum { kLevels, kSymmetry, kQuadDominant };  // Unsubdivide
 enum { kPercent, kLockBorder };     // Decimate
 
 // Save chunks of the per-node data.
@@ -171,8 +171,11 @@ public:
         int levels = 1;
         BOOL symmetry = TRUE;
         pblock->GetValue(kLevels, t, levels, valid);
+        BOOL quadDominant = FALSE;
         pblock->GetValue(kSymmetry, t, symmetry, valid);
-        return core.unsubdivide_modify(this, mc, node, mesh, ExodusUnsubdivide{levels, symmetry != FALSE}, state, is_reducer, text, owner);
+        pblock->GetValue(kQuadDominant, t, quadDominant, valid);
+        return core.unsubdivide_modify(this, mc, node, mesh, ExodusUnsubdivide{levels, symmetry != FALSE, quadDominant != FALSE}, state,
+                                       is_reducer, text, owner);
     }
 };
 
@@ -189,6 +192,10 @@ ParamBlockDesc2 unsubdividePbDesc(kParams, _M("parameters"), IDS_PARAMETERS, &un
     kSymmetry, _M("symmetry"), TYPE_BOOL, 0, IDS_SYMMETRY,
         p_default, TRUE,
         p_ui, TYPE_SINGLECHECKBOX, IDC_SYMMETRY,
+        p_end,
+    kQuadDominant, _M("quadDominant"), TYPE_BOOL, 0, IDS_QUAD_DOMINANT,
+        p_default, FALSE,
+        p_ui, TYPE_SINGLECHECKBOX, IDC_QUAD_DOMINANT,
         p_end,
     p_end);
 // clang-format on

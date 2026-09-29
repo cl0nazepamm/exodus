@@ -24,6 +24,7 @@ struct ExodusSink {
 struct ExodusUnsubdivide {
     int levels = 1;
     bool symmetry = true;
+    bool quadDominant = false;  // approximate levels by grouping quads into blocks (see subdiv.h)
 };
 
 struct ExodusDecimate {
@@ -133,7 +134,7 @@ struct ExodusCoreApi {
     void (*pack_forget)(Modifier* self);  // the modifier is gone: drop its layout
 };
 
-constexpr int kExodusCoreApiVersion = 6;
+constexpr int kExodusCoreApiVersion = 7;
 
 // The one export of exodus_maxcore.dll.
 extern "C" typedef const ExodusCoreApi* (*ExodusCoreApiFn)();
