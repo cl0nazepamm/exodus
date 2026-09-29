@@ -31,6 +31,7 @@ struct PackOptions {
     std::vector<Fill> fills;
     struct MapOverride { std::string channel, glob, file; };
     std::vector<MapOverride> maps;
+    std::vector<int> tiles;  // UDIM tiles to pack (1001, ...); empty = all. Faces elsewhere are left out.
     std::string previewChannel = "DiffuseColor";
     // decimation: off unless --tris, --decimate or --max-error is given
     size_t tris = 0;        // triangle budget for the whole scene
@@ -83,6 +84,8 @@ struct Island {
 struct Tile { int u = 0, v = 0; };
 
 int udim_number(Tile t);
+// "1001-1004, 1010" -> 1001 1002 1003 1004 1010; false on anything else.
+bool parse_tiles(const std::string& text, std::vector<int>& tiles);
 bool glob_match(const std::string& pattern, const std::string& s);  // * and ?, case-insensitive
 
 // Progress and warnings; printf-style. Goes to stdout unless a host sets `say_hook`.

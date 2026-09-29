@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <random>
 #include <set>
@@ -46,6 +47,26 @@ void say(const char* fmt, ...) {
 static int wrap(int a, int n) { a %= n; return a < 0 ? a + n : a; }
 
 int udim_number(Tile t) { return 1001 + t.u + 10 * t.v; }
+
+bool parse_tiles(const std::string& text, std::vector<int>& tiles) {
+    tiles.clear();
+    std::string s = text;
+    for (char& ch : s)
+        if (ch == ',' || ch == ';') ch = ' ';
+    size_t p = 0;
+    while ((p = s.find_first_not_of(" \t\r\n", p)) != std::string::npos) {
+        const size_t end = s.find_first_of(" \t\r\n", p);
+        const std::string item = s.substr(p, end == std::string::npos ? std::string::npos : end - p);
+        p = end;
+        char* rest = nullptr;
+        const long a = std::strtol(item.c_str(), &rest, 10);
+        long b = a;
+        if (*rest == '-') b = std::strtol(rest + 1, &rest, 10);
+        if (*rest || a < 1001 || b < a || b > 1999) return false;
+        for (long t = a; t <= b; ++t) tiles.push_back((int)t);
+    }
+    return true;
+}
 
 // "Body_1001.png" -> "Body_1002.png" when a shell sits in 1002 and that file exists;
 // "<UDIM>" tokens are always substituted.
@@ -317,6 +338,7 @@ bool Packer::bind() {
 
     // Face -> tile -> source.
     std::map<std::string, int> sourceByKey;
+    size_t outsideTiles = 0;
     faceSource.resize(scene.meshes.size());
     faceTile.resize(scene.meshes.size());
     for (size_t mi = 0; mi < scene.meshes.size(); ++mi) {
@@ -333,6 +355,10 @@ bool Packer::bind() {
             }
             Tile t{(int)std::floor(cu / f.count), (int)std::floor(cv / f.count)};
             faceTile[mi][fi] = t;
+            if (!o.tiles.empty() && std::find(o.tiles.begin(), o.tiles.end(), udim_number(t)) == o.tiles.end()) {
+                ++outsideTiles;
+                continue;
+            }
 
             const InMaterial& mat = scene.materials[f.material];
             std::vector<int> tex(channels.size(), -1);
@@ -361,6 +387,7 @@ bool Packer::bind() {
             faceSource[mi][fi] = sid;
         }
     }
+    if (outsideTiles) say("  %zu faces outside the chosen tiles left out\n", outsideTiles);
 
     // Source resolution and scale.
     for (Source& s : sources) {

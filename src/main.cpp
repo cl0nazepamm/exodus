@@ -30,6 +30,8 @@ static void usage() {
         "  --size N | WxH                atlas size (default: smallest power of two that fits)\n"
         "  --max-size N                  upper bound for the automatic size (default 16384)\n"
         "  --padding N                   minimum gap between islands in atlas pixels (default 8)\n"
+        "  --tiles LIST                  UDIM tiles to pack, e.g. 1001-1004,1010 (default all);\n"
+        "                                faces in other tiles are left out\n"
         "  --cell N                      packing grid cell in pixels (default 4)\n"
         "  --no-rotate                   keep every island upright\n"
         "  --scale <material-glob>=S     S = 1, 0.5, 0.25, 0.125 (2x box downsample per step)\n"
@@ -89,6 +91,9 @@ static bool parse_args(int argc, char** argv, PackOptions& o) {
         }
         else if (a == "--max-size") o.maxSize = std::stoi(next());
         else if (a == "--padding") o.padding = std::stoi(next());
+        else if (a == "--tiles") {
+            if (!parse_tiles(next(), o.tiles)) { std::fprintf(stderr, "--tiles expects UDIM numbers and ranges, e.g. 1001-1004,1010\n"); return false; }
+        }
         else if (a == "--cell") o.cell = std::stoi(next());
         else if (a == "--no-rotate") o.rotate = false;
         else if (a == "--no-obj") o.obj = false;
