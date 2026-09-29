@@ -1,4 +1,4 @@
-// udimpacker for 3ds Max: rollouts and strings.
+// Exodus for 3ds Max: rollouts and strings.
 #include <windows.h>
 #include "resource.h"
 
@@ -91,7 +91,7 @@ END
 
 STRINGTABLE
 BEGIN
-    IDS_CATEGORY "udimpacker"
+    IDS_CATEGORY "Exodus"
     IDS_UNSUBDIVIDE "Unsubdivide"
     IDS_PARAMETERS "Parameters"
     IDS_LEVELS "Levels"

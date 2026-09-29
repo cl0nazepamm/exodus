@@ -1,4 +1,4 @@
-// udimpacker - Catmull-Clark subdivision, forward and reverse.
+// Exodus - Catmull-Clark subdivision, forward and reverse.
 #include "subdiv.h"
 
 #include <algorithm>

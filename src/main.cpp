@@ -1,4 +1,4 @@
-// udimpacker - pack UDIM / multi-material UV islands and the texture pixels they own into one
+// Exodus - pack UDIM / multi-material UV islands and the texture pixels they own into one
 // atlas, without rendering. Each island is cut out of its source maps by its own UV coverage and
 // moved by a whole-pixel offset and a quarter-turn rotation, so every covered texel is copied
 // bit-for-bit. Pixels no island owns are filled by bleeding the islands outward.
@@ -24,7 +24,7 @@ using Clock = std::chrono::steady_clock;
 
 static void usage() {
     std::puts(
-        "udimpacker <scene.fbx|scene.obj> -o <out-dir> [options]\n"
+        "exodus <scene.fbx|scene.obj> -o <out-dir> [options]\n"
         "\n"
         "  --info                        list meshes, materials, maps and UDIM tiles, then exit\n"
         "  --size N | WxH                atlas size (default: smallest power of two that fits)\n"

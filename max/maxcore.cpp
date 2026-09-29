@@ -1,4 +1,4 @@
-// udimpacker for 3ds Max: the work, in a DLL the plugin loads from a copy and can reload
+// Exodus for 3ds Max: the work, in a DLL the plugin loads from a copy and can reload
 // (see maxcore_api.h). Everything here runs on Max's main thread, called from the plugin.
 #include <max.h>
 #include <iskin.h>
@@ -25,7 +25,7 @@
 #include "decimate.h"
 #include "maxcore_api.h"
 #include "subdiv.h"
-#include "udimpacker.h"
+#include "exodus.h"
 
 namespace {
 
@@ -104,7 +104,7 @@ std::string material_json(Mtl* m) {
     return j + "]}";
 }
 
-bool inspect(INode* node, UdimSink out) {
+bool inspect(INode* node, ExodusSink out) {
     const TimeValue t = GetCOREInterface()->GetTime();
     std::string j = "{\"node\": " + json_string(utf8(MSTR(node->GetName())));
     const Stack st = stack_of(node);
@@ -244,7 +244,7 @@ bool inspect(INode* node, UdimSink out) {
 }
 
 // ------------------------------------------------------------------------------------------------
-// MNMesh and udimpacker's mesh. Corners are numbered over the live faces in order. Every corner
+// MNMesh and Exodus's mesh. Corners are numbered over the live faces in order. Every corner
 // gets a wedge id: its values in every map channel, its explicit normal and its face's smoothing
 // group; a change in any of them is a seam the algorithms keep.
 
@@ -326,7 +326,7 @@ uint64_t topology_hash(MNMesh& m, Fnv h) {
     return h.h;
 }
 
-// The mesh as udimpacker's: corners carry their input corner (cornerSrc) and wedge (cornerSeam).
+// The mesh as Exodus's: corners carry their input corner (cornerSrc) and wedge (cornerSeam).
 // Without `values` the wedges stand in for the UVs (unsubdivide only compares them); with it the
 // UVs are channel 1, the normals the explicit normals, and the faces are triangulated (decimate).
 InMesh to_inmesh(MNMesh& m, const CornerTable& ct, bool values) {
@@ -386,7 +386,7 @@ InMesh to_inmesh(MNMesh& m, const CornerTable& ct, bool values) {
 }
 
 // The plan from an algorithm's result mesh (corners carry their input corner).
-bool finish_plan(MNMesh& m, const CornerTable& ct, const InMesh& r, UdimPlan& plan) {
+bool finish_plan(MNMesh& m, const CornerTable& ct, const InMesh& r, ExodusPlan& plan) {
     if (r.cornerSrc.size() != r.cornerPos.size()) return false;
     plan.faceFirst.clear();
     plan.corner.clear();
@@ -403,14 +403,14 @@ bool finish_plan(MNMesh& m, const CornerTable& ct, const InMesh& r, UdimPlan& pl
     return true;
 }
 
-uint64_t unsubdivide_signature(MNMesh& m, const UdimUnsubdivide& s) {
+uint64_t unsubdivide_signature(MNMesh& m, const ExodusUnsubdivide& s) {
     Fnv h = settings_hash('U');
     h.add((uint64_t)s.levels);
     h.add(s.symmetry);
     return topology_hash(m, h);
 }
 
-bool unsubdivide_plan(MNMesh& m, const UdimUnsubdivide& s, UdimPlan& plan) {
+bool unsubdivide_plan(MNMesh& m, const ExodusUnsubdivide& s, ExodusPlan& plan) {
     plan = {};
     plan.signature = unsubdivide_signature(m, s);
     const CornerTable ct = corners_of(m);
@@ -436,14 +436,14 @@ bool unsubdivide_plan(MNMesh& m, const UdimUnsubdivide& s, UdimPlan& plan) {
     return true;
 }
 
-uint64_t decimate_signature(MNMesh& m, const UdimDecimate& s) {
+uint64_t decimate_signature(MNMesh& m, const ExodusDecimate& s) {
     Fnv h = settings_hash('D');
     h.add(std::bit_cast<uint32_t>(s.percent));
     h.add(s.lockBorder);
     return topology_hash(m, h);
 }
 
-bool decimate_plan(MNMesh& m, const UdimDecimate& s, UdimPlan& plan) {
+bool decimate_plan(MNMesh& m, const ExodusDecimate& s, ExodusPlan& plan) {
     plan = {};
     plan.signature = decimate_signature(m, s);
     const CornerTable ct = corners_of(m);
@@ -479,7 +479,7 @@ struct Remap {
 
 // The result: the plan's faces with the input's own vertices, map channels, explicit normals,
 // material IDs and smoothing groups, each renumbered in its original order.
-bool apply_plan(MNMesh& m, const UdimPlan& plan, MNMesh& out) {
+bool apply_plan(MNMesh& m, const ExodusPlan& plan, MNMesh& out) {
     const CornerTable ct = corners_of(m);
     const size_t nc = ct.face.size();
     for (uint32_t c : plan.corner)
@@ -606,7 +606,7 @@ struct SkinAbove {
     bool top = false;  // no other reducing modifier between this one and the Skin
 };
 
-SkinAbove skin_above(INode* node, Modifier* self, UdimIsReducer isReducer) {
+SkinAbove skin_above(INode* node, Modifier* self, ExodusIsReducer isReducer) {
     SkinAbove s;
     if (!node) return s;
     for (Object* obj = node->GetObjectRef(); obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID;
@@ -633,7 +633,7 @@ SkinAbove skin_above(INode* node, Modifier* self, UdimIsReducer isReducer) {
 
 // Positions compared bit for bit (-0 and +0 alike).
 struct PosHash {
-    size_t operator()(const UdimPos& p) const {
+    size_t operator()(const ExodusPos& p) const {
         uint64_t h = 1469598103934665603ull;
         for (float x : p) {
             h ^= std::bit_cast<uint32_t>(x + 0.0f);
@@ -644,24 +644,24 @@ struct PosHash {
 };
 
 struct PosIndex {
-    std::unordered_map<UdimPos, uint32_t, PosHash> at;
-    explicit PosIndex(const UdimSkinCopy& c) {
+    std::unordered_map<ExodusPos, uint32_t, PosHash> at;
+    explicit PosIndex(const ExodusSkinCopy& c) {
         for (uint32_t i = 0; i < c.pos.size(); ++i) at.try_emplace(c.pos[i], i);
     }
-    uint32_t find(const UdimPos& p) const {
+    uint32_t find(const ExodusPos& p) const {
         auto it = at.find(p);
         return it == at.end() ? kNone : it->second;
     }
 };
 
-UdimPos pos_of(MNMesh& m, int v) { return {m.P(v).x, m.P(v).y, m.P(v).z}; }
+ExodusPos pos_of(MNMesh& m, int v) { return {m.P(v).x, m.P(v).y, m.P(v).z}; }
 
-INode* copy_bone(UdimSkinCopy& c, uint32_t i) {
+INode* copy_bone(ExodusSkinCopy& c, uint32_t i) {
     if (!c.bones[i] && !c.boneNames[i].empty()) c.bones[i] = GetCOREInterface()->GetINodeByName(c.boneNames[i].c_str());
     return c.bones[i];
 }
 
-uint32_t copy_bone_index(UdimSkinCopy& c, INode* node) {
+uint32_t copy_bone_index(ExodusSkinCopy& c, INode* node) {
     for (uint32_t i = 0; i < c.bones.size(); ++i)
         if (copy_bone(c, i) == node) return i;
     c.bones.push_back(node);
@@ -671,7 +671,7 @@ uint32_t copy_bone_index(UdimSkinCopy& c, INode* node) {
 
 // Skin's weights of its vertex i against copied vertex v: the same bones, each weight within
 // `tolerance` (0 = identical). Skin normalizes what it is given, which can move the last bit.
-bool skin_matches(const SkinAbove& s, int i, UdimSkinCopy& c, uint32_t v, float tolerance) {
+bool skin_matches(const SkinAbove& s, int i, ExodusSkinCopy& c, uint32_t v, float tolerance) {
     const int n = s.ctx->GetNumAssignedBones(i);
     if (n != (int)(c.first[v + 1] - c.first[v])) return false;
     for (int k = 0; k < n; ++k) {
@@ -686,7 +686,7 @@ bool skin_matches(const SkinAbove& s, int i, UdimSkinCopy& c, uint32_t v, float 
 }
 
 // Appends Skin's weights of its vertex i as copied vertex at `p`.
-void copy_skin_vertex(const SkinAbove& s, int i, const UdimPos& p, UdimSkinCopy& c) {
+void copy_skin_vertex(const SkinAbove& s, int i, const ExodusPos& p, ExodusSkinCopy& c) {
     if (c.first.empty()) c.first.push_back(0);
     c.pos.push_back(p);
     for (int k = 0; k < s.ctx->GetNumAssignedBones(i); ++k) {
@@ -697,7 +697,7 @@ void copy_skin_vertex(const SkinAbove& s, int i, const UdimPos& p, UdimSkinCopy&
 }
 
 // Takes Skin's weights of every input vertex while Skin still has them all.
-void capture(const SkinAbove& s, MNMesh& input, UdimSkinCopy& c) {
+void capture(const SkinAbove& s, MNMesh& input, ExodusSkinCopy& c) {
     c.pos.clear();
     c.first.clear();
     c.bone.clear();
@@ -712,7 +712,7 @@ void capture(const SkinAbove& s, MNMesh& input, UdimSkinCopy& c) {
 
 // Before the vertex set changes: weights painted on the current vertices go into the copy
 // (vertices Skin still has as copied, float noise aside, keep their copied values).
-void fold_back(const SkinAbove& s, UdimSkinCopy& c) {
+void fold_back(const SkinAbove& s, ExodusSkinCopy& c) {
     if (!c.inSync || s.ctx->GetNumPoints() != (int)c.synced.size()) return;
     const PosIndex index(c);
     std::vector<int> painted(c.pos.size(), -1);  // copied vertex -> Skin vertex whose weights replace it
@@ -723,7 +723,7 @@ void fold_back(const SkinAbove& s, UdimSkinCopy& c) {
         else if (!skin_matches(s, (int)i, c, v, 1e-6f)) painted[v] = (int)i;
     }
     if (added.empty() && std::all_of(painted.begin(), painted.end(), [](int i) { return i < 0; })) return;
-    UdimSkinCopy out = c;
+    ExodusSkinCopy out = c;
     out.pos.clear();
     out.first.clear();
     out.bone.clear();
@@ -751,7 +751,7 @@ std::wstring wide(const std::string& s) { return std::wstring(MSTR::FromUTF8(s.c
 // does not match `signature`.
 template <class MakePlan>
 bool reduce_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, bool active, uint64_t signature, MakePlan&& plan,
-                   UdimReduceState& st, UdimIsReducer isReducer, std::wstring& status, INode*& nodeOut) {
+                   ExodusReduceState& st, ExodusIsReducer isReducer, std::wstring& status, INode*& nodeOut) {
     if (!node) node = node_of(self, &mc);
     nodeOut = node;
     const SkinAbove skin = skin_above(node, self, isReducer);
@@ -768,7 +768,7 @@ bool reduce_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, bo
             report = "the plan does not fit the input";
         }
     }
-    std::vector<UdimPos> current(mesh.VNum());
+    std::vector<ExodusPos> current(mesh.VNum());
     for (int v = 0; v < mesh.VNum(); ++v) current[v] = pos_of(mesh, v);
 
     bool write = false;
@@ -791,19 +791,19 @@ bool reduce_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, bo
     return write;
 }
 
-bool unsubdivide_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, const UdimUnsubdivide& s, UdimReduceState& st,
-                        UdimIsReducer isReducer, std::wstring& status, INode*& nodeOut) {
+bool unsubdivide_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, const ExodusUnsubdivide& s, ExodusReduceState& st,
+                        ExodusIsReducer isReducer, std::wstring& status, INode*& nodeOut) {
     return reduce_modify(self, mc, node, mesh, s.levels > 0, unsubdivide_signature(mesh, s),
-                         [&](UdimPlan& p) { unsubdivide_plan(mesh, s, p); }, st, isReducer, status, nodeOut);
+                         [&](ExodusPlan& p) { unsubdivide_plan(mesh, s, p); }, st, isReducer, status, nodeOut);
 }
 
-bool decimate_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, const UdimDecimate& s, UdimReduceState& st,
-                     UdimIsReducer isReducer, std::wstring& status, INode*& nodeOut) {
+bool decimate_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, const ExodusDecimate& s, ExodusReduceState& st,
+                     ExodusIsReducer isReducer, std::wstring& status, INode*& nodeOut) {
     return reduce_modify(self, mc, node, mesh, s.percent < 100, decimate_signature(mesh, s),
-                         [&](UdimPlan& p) { decimate_plan(mesh, s, p); }, st, isReducer, status, nodeOut);
+                         [&](ExodusPlan& p) { decimate_plan(mesh, s, p); }, st, isReducer, status, nodeOut);
 }
 
-bool write_weights(INode* node, Modifier* self, UdimReduceState& st, const std::vector<UdimSkinCopy*>& below) {
+bool write_weights(INode* node, Modifier* self, ExodusReduceState& st, const std::vector<ExodusSkinCopy*>& below) {
     if (!node || st.skin.empty()) return false;
     node->EvalWorldState(GetCOREInterface()->GetTime());  // Skin remaps to the current vertices
     const SkinAbove skin = skin_above(node, self, nullptr);
@@ -811,12 +811,12 @@ bool write_weights(INode* node, Modifier* self, UdimReduceState& st, const std::
     if (!skin.ctx || !import || skin.ctx->GetNumPoints() != (int)st.current.size()) return false;
     const PosIndex own(st.skin);
     std::vector<PosIndex> lower;
-    for (UdimSkinCopy* c : below) lower.emplace_back(*c);
+    for (ExodusSkinCopy* c : below) lower.emplace_back(*c);
     Tab<INode*> bones;
     Tab<float> weights;
     int written = 0;
     for (size_t i = 0; i < st.current.size(); ++i) {
-        UdimSkinCopy* c = &st.skin;
+        ExodusSkinCopy* c = &st.skin;
         uint32_t v = own.find(st.current[i]);
         for (size_t k = 0; v == kNone && k < below.size(); ++k)
             if ((v = lower[k].find(st.current[i])) != kNone) c = below[k];
@@ -863,7 +863,7 @@ struct PackState {
     std::unique_ptr<Packer> packer;
     std::map<ULONG, PackUVs> uvs;
     std::string report, log;          // status line and the packer's report of the layout
-    std::vector<UdimPackTile> tiles;
+    std::vector<ExodusPackTile> tiles;
 };
 
 std::recursive_mutex packLock;
@@ -1004,7 +1004,7 @@ int face_udim(const InMesh& m, const InFace& f) {
     return t.u >= 0 && t.u < 10 && t.v >= 0 && t.v < 100 ? udim_number(t) : -1;
 }
 
-uint64_t layout_signature(const PackState& st, const UdimPackSettings& s) {
+uint64_t layout_signature(const PackState& st, const ExodusPackSettings& s) {
     Fnv h = settings_hash('P');
     for (const auto& [handle, part] : st.parts) {
         h.add(handle);
@@ -1014,11 +1014,11 @@ uint64_t layout_signature(const PackState& st, const UdimPackSettings& s) {
     h.add((uint64_t)s.maxSize);
     h.add((uint64_t)s.padding);
     h.add(s.rotate);
-    for (int c = 0; c < kUdimPackChannels; ++c) {
+    for (int c = 0; c < kExodusPackChannels; ++c) {
         add_text(h, s.channel[c]);
         h.add((uint64_t)s.kind[c]);
     }
-    for (const UdimPackMap& m : s.maps) {
+    for (const ExodusPackMap& m : s.maps) {
         h.add((uint64_t)m.tile);
         h.add((uint64_t)m.channel);
         add_text(h, m.file);
@@ -1057,13 +1057,13 @@ PackUVs packed_uvs(const Packer& P, size_t mi, const PackPart& part) {
 }
 
 // Tiles in use, from the parts' source UVs and the maps.
-std::vector<UdimPackTile> pack_tiles(const PackState& st, const UdimPackSettings& s) {
+std::vector<ExodusPackTile> pack_tiles(const PackState& st, const ExodusPackSettings& s) {
     std::map<int, int> faces;
     for (const auto& [handle, part] : st.parts)
         for (const InFace& f : part.mesh.faces)
             if (const int udim = face_udim(part.mesh, f); udim > 0) ++faces[udim];
-    for (const UdimPackMap& m : s.maps) faces.try_emplace(m.tile, 0);
-    std::vector<UdimPackTile> tiles;
+    for (const ExodusPackMap& m : s.maps) faces.try_emplace(m.tile, 0);
+    std::vector<ExodusPackTile> tiles;
     for (auto [tile, n] : faces) tiles.push_back({tile, n});
     return tiles;
 }
@@ -1076,7 +1076,7 @@ std::string last_line(const std::string& log) {
     return s.substr(s.find_first_not_of(' ') == std::string::npos ? 0 : s.find_first_not_of(' '));
 }
 
-void make_layout(PackState& st, const UdimPackSettings& s) {
+void make_layout(PackState& st, const ExodusPackSettings& s) {
     st.ok = false;
     st.packer.reset();
     st.uvs.clear();
@@ -1099,8 +1099,8 @@ void make_layout(PackState& st, const UdimPackSettings& s) {
     scene.materials.push_back({"<no maps>"});
     o.excludes.push_back("<no maps>");
     std::map<int, uint32_t> tileMaterial;
-    for (const UdimPackMap& m : s.maps) {
-        if (m.channel < 0 || m.channel >= kUdimPackChannels || s.channel[m.channel].empty() || m.file.empty()) continue;
+    for (const ExodusPackMap& m : s.maps) {
+        if (m.channel < 0 || m.channel >= kExodusPackChannels || s.channel[m.channel].empty() || m.file.empty()) continue;
         auto [it, fresh] = tileMaterial.try_emplace(m.tile, (uint32_t)scene.materials.size());
         if (fresh) scene.materials.push_back({std::to_string(m.tile)});
         InTexture tex;
@@ -1112,7 +1112,7 @@ void make_layout(PackState& st, const UdimPackSettings& s) {
         if (same != textures.end()) *same = tex;
         else textures.push_back(tex);
     }
-    for (int c = 0; c < kUdimPackChannels; ++c)
+    for (int c = 0; c < kExodusPackChannels; ++c)
         if (!s.channel[c].empty()) o.kinds[utf8(s.channel[c].c_str())] = s.kind[c] == 1 ? "normal-gl" : s.kind[c] == 2 ? "normal-dx" : "color";
     if (tileMaterial.empty()) {
         st.report = "assign maps to the tiles to pack";
@@ -1148,7 +1148,7 @@ void make_layout(PackState& st, const UdimPackSettings& s) {
     st.report = line;
     // The first warning, if any: unreadable maps, maps of one tile at unrelated sizes, ...
     if (const size_t w = st.log.find("  ! "); w != std::string::npos) st.report += "\n" + st.log.substr(w + 4, st.log.find('\n', w) - w - 4);
-    for (int c = 0; c < kUdimPackChannels; ++c) {
+    for (int c = 0; c < kExodusPackChannels; ++c) {
         std::wstring low = s.channel[c];
         for (wchar_t& ch : low) ch = (wchar_t)towlower(ch);
         if (s.rotate && s.kind[c] == 0 && low.find(L"normal") != std::wstring::npos)
@@ -1186,8 +1186,8 @@ struct Busy {
     ~Busy() { if (entered) packBusy.erase(mod); }
 };
 
-bool pack_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, const UdimPackSettings& s, std::wstring& status,
-                 std::vector<UdimPackTile>& tiles) {
+bool pack_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, const ExodusPackSettings& s, std::wstring& status,
+                 std::vector<ExodusPackTile>& tiles) {
     std::lock_guard guard(packLock);
     Busy busy(self);
     if (!busy.entered) return false;  // evaluating another part came back here: leave this one as it is
@@ -1240,7 +1240,7 @@ bool pack_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, cons
     return changed && uses.size() > 1;
 }
 
-bool pack_bake(Modifier* self, const UdimPackSettings& s, UdimSink out, std::wstring& status, bool& relayout) {
+bool pack_bake(Modifier* self, const ExodusPackSettings& s, ExodusSink out, std::wstring& status, bool& relayout) {
     std::lock_guard guard(packLock);
     Busy busy(self);
     relayout = false;
@@ -1274,7 +1274,7 @@ bool pack_bake(Modifier* self, const UdimPackSettings& s, UdimSink out, std::wst
     const std::filesystem::path scene = GetCOREInterface()->GetCurFilePath().data();
     if (dir.empty()) {
         if (scene.empty()) return fail("save the scene or choose an output folder");
-        dir = scene.parent_path() / L"udimpacker";
+        dir = scene.parent_path() / L"exodus";
     }
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
@@ -1312,9 +1312,9 @@ void pack_forget(Modifier* self) {
     packs.erase(self);
 }
 
-const UdimCoreApi kApi{kUdimCoreApiVersion, kBuild, inspect, unsubdivide_modify, decimate_modify, write_weights,
+const ExodusCoreApi kApi{kExodusCoreApiVersion, kBuild, inspect, unsubdivide_modify, decimate_modify, write_weights,
                        pack_modify, pack_bake, pack_forget};
 
 }  // namespace
 
-extern "C" __declspec(dllexport) const UdimCoreApi* udim_core_api() { return &kApi; }
+extern "C" __declspec(dllexport) const ExodusCoreApi* exodus_core_api() { return &kApi; }

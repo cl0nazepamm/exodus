@@ -1,4 +1,4 @@
-// udimpacker - shared, DCC-neutral scene types.
+// Exodus - shared, DCC-neutral scene types.
 #pragma once
 
 #include <array>

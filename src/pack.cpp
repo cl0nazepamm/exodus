@@ -1,4 +1,4 @@
-// udimpacker - true-shape raster packer.
+// Exodus - true-shape raster packer.
 #include "pack.h"
 
 #include <algorithm>

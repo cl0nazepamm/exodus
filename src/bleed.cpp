@@ -1,4 +1,4 @@
-// udimpacker - background bleed.
+// Exodus - background bleed.
 #include "bleed.h"
 
 #include <cmath>

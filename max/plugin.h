@@ -1,4 +1,4 @@
-// udimpacker for 3ds Max: what the plugin's parts share.
+// Exodus for 3ds Max: what the plugin's parts share.
 #pragma once
 
 #include <max.h>
@@ -8,12 +8,12 @@
 
 extern HINSTANCE hInstance;
 
-const MCHAR* udim_string(int id);  // a string from udimpacker.rc
+const MCHAR* exodus_string(int id);  // a string from exodus.rc
 
 // The loaded core DLL, loading it on first use; nullptr when it cannot be loaded.
-const UdimCoreApi* udim_core();
-const UdimCoreApi* udim_core_loaded();  // the core DLL if it is loaded, without loading it
-MSTR udim_core_error();
+const ExodusCoreApi* exodus_core();
+const ExodusCoreApi* exodus_core_loaded();  // the core DLL if it is loaded, without loading it
+MSTR exodus_core_error();
 
 ClassDesc2* unsubdivide_desc();
 ClassDesc2* decimate_desc();

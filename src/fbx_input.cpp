@@ -1,5 +1,5 @@
-// udimpacker - FBX/OBJ input through ufbx.
-#include "udimpacker.h"
+// Exodus - FBX/OBJ input through ufbx.
+#include "exodus.h"
 
 #include <filesystem>
 #include <map>

@@ -1,4 +1,4 @@
-// udimpacker - game-mesh decimation through meshoptimizer. Runs before islands are cut, so the
+// Exodus - game-mesh decimation through meshoptimizer. Runs before islands are cut, so the
 // atlas is packed from the decimated triangles. Collapses only move onto existing vertices, so
 // every UV in the result is an original UV and the texel copy stays exact.
 #pragma once
@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-#include "udimpacker.h"
+#include "exodus.h"
 
 struct DecimateOptions {
     size_t targetTris = 0;     // triangle budget for the whole scene; 0 = as far as maxError allows

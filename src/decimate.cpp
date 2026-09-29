@@ -1,4 +1,4 @@
-// udimpacker - game-mesh decimation through meshoptimizer.
+// Exodus - game-mesh decimation through meshoptimizer.
 #include "decimate.h"
 
 #include <algorithm>

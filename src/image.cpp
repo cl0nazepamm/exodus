@@ -1,6 +1,6 @@
-// udimpacker - image I/O (stb_image in, lodepng out).
+// Exodus - image I/O (stb_image in, lodepng out).
 #include "image.h"
-#include "udimpacker.h"
+#include "exodus.h"
 
 #include <cstring>
 #include <filesystem>

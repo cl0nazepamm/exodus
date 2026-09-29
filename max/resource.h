@@ -1,4 +1,4 @@
-// udimpacker for 3ds Max: resource ids (udimpacker.rc).
+// Exodus for 3ds Max: resource ids (exodus.rc).
 #pragma once
 
 #define IDS_CATEGORY 1

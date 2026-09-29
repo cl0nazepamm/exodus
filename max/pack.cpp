@@ -1,4 +1,4 @@
-// udimpacker for 3ds Max: the UDIM Pack modifier. One instance goes on every part of a character
+// Exodus for 3ds Max: the UDIM Pack modifier. One instance goes on every part of a character
 // (select them all, add the modifier once). The maps are given by hand per UDIM tile: pick a tile
 // in the list, pick a file for each channel. Tiles with maps are packed into one atlas, the packed
 // UVs go into the target map channel and Bake writes the atlas maps. The layout lives in the core
@@ -37,7 +37,7 @@ class PackMod : public Modifier {
 public:
     IParamBlock2* pblock = nullptr;
     MSTR status;
-    std::vector<UdimPackTile> tiles;  // from the last evaluation
+    std::vector<ExodusPackTile> tiles;  // from the last evaluation
     int selectedTile = 0;             // tile shown in the rollout's map rows
     std::vector<std::wstring> shownLines;  // the tile list as shown
     bool refreshPending = false;
@@ -45,14 +45,14 @@ public:
     PackMod();
     ~PackMod() override {
         packInstances.erase(this);
-        if (const UdimCoreApi* core = udim_core_loaded()) core->pack_forget(this);
+        if (const ExodusCoreApi* core = exodus_core_loaded()) core->pack_forget(this);
     }
 
     ClassDesc2& Desc() const;
     ParamBlockDesc2& PbDesc() const;
 
-    UdimPackSettings Settings(TimeValue t, Interval& valid) {
-        UdimPackSettings s;
+    ExodusPackSettings Settings(TimeValue t, Interval& valid) {
+        ExodusPackSettings s;
         BOOL rotate = TRUE;
         pblock->GetValue(kSourceChannel, t, s.sourceChannel, valid);
         pblock->GetValue(kTargetChannel, t, s.targetChannel, valid);
@@ -65,7 +65,7 @@ public:
             const MCHAR* v = pblock->GetStr(id, t, i);
             return std::wstring(v ? v : L"");
         };
-        for (int c = 0; c < kUdimPackChannels; ++c) {
+        for (int c = 0; c < kExodusPackChannels; ++c) {
             s.channel[c] = str(kChannel1 + c);
             pblock->GetValue(kKind1 + c, t, s.kind[c], valid);
         }
@@ -102,17 +102,17 @@ public:
             pblock->Delete(kMapChannels, row, 1);
             pblock->Delete(kMapTiles, row, 1);
         }
-        theHold.Accept(udim_string(IDS_ASSIGN_MAP));
+        theHold.Accept(exodus_string(IDS_ASSIGN_MAP));
     }
 
     // Bake: the atlas maps into the output folder. Returns the packer's report.
     MSTR Bake() {
-        const UdimCoreApi* core = udim_core();
-        if (!core) return status = udim_core_error();
+        const ExodusCoreApi* core = exodus_core();
+        if (!core) return status = exodus_core_error();
         Interval valid = FOREVER;
-        const UdimPackSettings s = Settings(GetCOREInterface()->GetTime(), valid);
+        const ExodusPackSettings s = Settings(GetCOREInterface()->GetTime(), valid);
         std::string log;
-        UdimSink sink{[](void* ctx, const char* text, size_t n) { static_cast<std::string*>(ctx)->append(text, n); }, &log};
+        ExodusSink sink{[](void* ctx, const char* text, size_t n) { static_cast<std::string*>(ctx)->append(text, n); }, &log};
         std::wstring text;
         bool relayout = false;
         HCURSOR cursor = SetCursor(LoadCursor(nullptr, IDC_WAIT));
@@ -133,11 +133,11 @@ public:
 
     // Animatable
     void DeleteThis() override { delete this; }
-    void GetClassName(MSTR& s, bool localized) const override { s = localized ? udim_string(IDS_UDIMPACK) : _M("UDIM Pack"); }
+    void GetClassName(MSTR& s, bool localized) const override { s = localized ? exodus_string(IDS_UDIMPACK) : _M("UDIM Pack"); }
     Class_ID ClassID() override { return kPackClassId; }
     int NumSubs() override { return 1; }
     Animatable* SubAnim(int) override { return pblock; }
-    MSTR SubAnimName(int, bool localized) override { return localized ? udim_string(IDS_PARAMETERS) : _M("Parameters"); }
+    MSTR SubAnimName(int, bool localized) override { return localized ? exodus_string(IDS_PARAMETERS) : _M("Parameters"); }
     int NumParamBlocks() override { return 1; }
     IParamBlock2* GetParamBlock(int) override { return pblock; }
     IParamBlock2* GetParamBlockByID(BlockID id) override { return pblock && pblock->ID() == id ? pblock : nullptr; }
@@ -163,7 +163,7 @@ protected:
 
 public:
     // BaseObject / Modifier
-    const MCHAR* GetObjectName(bool localized) const override { return localized ? udim_string(IDS_UDIMPACK) : _M("UDIM Pack"); }
+    const MCHAR* GetObjectName(bool localized) const override { return localized ? exodus_string(IDS_UDIMPACK) : _M("UDIM Pack"); }
     CreateMouseCallBack* GetCreateMouseCallBack() override { return nullptr; }
     BOOL ChangeTopology() override { return FALSE; }
     ChannelMask ChannelsUsed() override { return TOPO_CHANNEL | TEXMAP_CHANNEL; }
@@ -175,13 +175,13 @@ public:
         if (!os->obj->IsSubClassOf(polyObjectClassID)) return;
         auto* po = static_cast<PolyObject*>(os->obj);
         Interval valid = FOREVER;
-        const UdimPackSettings s = Settings(t, valid);
-        if (const UdimCoreApi* core = udim_core()) {
+        const ExodusPackSettings s = Settings(t, valid);
+        if (const ExodusCoreApi* core = exodus_core()) {
             std::wstring text;
             if (core->pack_modify(this, mc, node, po->GetMesh(), s, text, tiles)) post_refresh(this);
             status = text.c_str();
         } else {
-            status = udim_core_error();
+            status = exodus_core_error();
         }
         UpdateUI();
         po->UpdateValidity(TEXMAP_CHAN_NUM, valid);
@@ -219,7 +219,7 @@ void PackMod::UpdateUI() {
 
     // Tiles: the ones in the UVs and the ones with maps.
     std::vector<int> list;
-    for (const UdimPackTile& t : tiles) list.push_back(t.tile);
+    for (const ExodusPackTile& t : tiles) list.push_back(t.tile);
     for (int i = 0; i < pblock->Count(kMapTiles); ++i) list.push_back(pblock->GetInt(kMapTiles, 0, i));
     std::sort(list.begin(), list.end());
     list.erase(std::unique(list.begin(), list.end()), list.end());
@@ -228,9 +228,9 @@ void PackMod::UpdateUI() {
     std::vector<std::wstring> lines;
     for (int tile : list) {
         int faces = 0, maps = 0;
-        for (const UdimPackTile& t : tiles)
+        for (const ExodusPackTile& t : tiles)
             if (t.tile == tile) faces = t.faces;
-        for (int c = 0; c < kUdimPackChannels; ++c) maps += FindMap(tile, c) >= 0;
+        for (int c = 0; c < kExodusPackChannels; ++c) maps += FindMap(tile, c) >= 0;
         wchar_t line[128];
         swprintf_s(line, L"%d   %d faces   %s", tile, faces,
                    maps ? (std::to_wstring(maps) + (maps == 1 ? L" map" : L" maps")).c_str() : L"not packed");
@@ -255,7 +255,7 @@ void PackMod::UpdateUI() {
 
     // The selected tile's map per channel.
     SetDlgItemText(hw, IDC_TILE_LABEL, list.empty() ? L"" : (L"Maps of tile " + std::to_wstring(selectedTile) + L":").c_str());
-    for (int c = 0; c < kUdimPackChannels; ++c) {
+    for (int c = 0; c < kExodusPackChannels; ++c) {
         const MCHAR* name = pblock->GetStr(kChannel1 + c, 0);
         const bool used = name && *name && !list.empty();
         const int row = FindMap(selectedTile, c);
@@ -303,24 +303,24 @@ public:
                 return TRUE;
             }
             if (code != BN_CLICKED) return FALSE;
-            if (id >= IDC_FILE1 && id < IDC_FILE1 + kUdimPackChannels) {
+            if (id >= IDC_FILE1 && id < IDC_FILE1 + kExodusPackChannels) {
                 const int c = id - IDC_FILE1, row = mod->FindMap(mod->selectedTile, c);
                 const MCHAR* current = row >= 0 ? mod->pblock->GetStr(kMapFiles, 0, row) : nullptr;
                 const std::wstring file = pick_image(GetCOREInterface()->GetMAXHWnd(), current ? current : L"");
                 if (!file.empty()) mod->SetMap(mod->selectedTile, c, file.c_str());
                 return TRUE;
             }
-            if (id >= IDC_CLEAR1 && id < IDC_CLEAR1 + kUdimPackChannels) {
+            if (id >= IDC_CLEAR1 && id < IDC_CLEAR1 + kExodusPackChannels) {
                 mod->SetMap(mod->selectedTile, id - IDC_CLEAR1, nullptr);
                 return TRUE;
             }
             if (id == IDC_OUT_DIR_BROWSE) {
                 MCHAR dir[MAX_PATH] = L"";
-                GetCOREInterface()->ChooseDirectory(GetCOREInterface()->GetMAXHWnd(), udim_string(IDS_CHOOSE_OUT_DIR), dir);
+                GetCOREInterface()->ChooseDirectory(GetCOREInterface()->GetMAXHWnd(), exodus_string(IDS_CHOOSE_OUT_DIR), dir);
                 if (*dir) {
                     theHold.Begin();
                     mod->pblock->SetValue(kOutDir, 0, dir);
-                    theHold.Accept(udim_string(IDS_OUT_DIR));
+                    theHold.Accept(exodus_string(IDS_OUT_DIR));
                 }
                 return TRUE;
             }
@@ -340,17 +340,17 @@ class PackClassDesc : public ClassDesc2 {
 public:
     int IsPublic() override { return TRUE; }
     void* Create(BOOL) override { return new PackMod; }
-    const MCHAR* ClassName() override { return udim_string(IDS_UDIMPACK); }
+    const MCHAR* ClassName() override { return exodus_string(IDS_UDIMPACK); }
     const MCHAR* NonLocalizedClassName() override { return _M("UDIM Pack"); }
     SClass_ID SuperClassID() override { return OSM_CLASS_ID; }
     Class_ID ClassID() override { return kPackClassId; }
-    const MCHAR* Category() override { return udim_string(IDS_CATEGORY); }
-    const MCHAR* InternalName() override { return _M("udimPack"); }
+    const MCHAR* Category() override { return exodus_string(IDS_CATEGORY); }
+    const MCHAR* InternalName() override { return _M("exodusPack"); }
     HINSTANCE HInstance() override { return hInstance; }
 } packDesc;
 
 // Channel c (0-based) is `channel<n>` and `channelType<n>` in MAXScript, n = c + 1.
-#define UDIM_CHANNEL_PARAMS(c, n, name)                                                                \
+#define PACK_CHANNEL_PARAMS(c, n, name)                                                                \
     kChannel1 + c, _M("channel" #n), TYPE_STRING, 0, IDS_CHANNEL,                                     \
         p_default, name,                                                                               \
         p_ui, TYPE_EDITBOX, IDC_CHANNEL1 + c,                                                          \
@@ -401,12 +401,12 @@ ParamBlockDesc2 packPbDesc(kParams, _M("parameters"), IDS_PARAMETERS, &packDesc,
         p_default, _M("atlas"),
         p_ui, TYPE_EDITBOX, IDC_PREFIX,
         p_end,
-    UDIM_CHANNEL_PARAMS(0, 1, _M("BaseColor"))
-    UDIM_CHANNEL_PARAMS(1, 2, _M(""))
-    UDIM_CHANNEL_PARAMS(2, 3, _M(""))
-    UDIM_CHANNEL_PARAMS(3, 4, _M(""))
-    UDIM_CHANNEL_PARAMS(4, 5, _M(""))
-    UDIM_CHANNEL_PARAMS(5, 6, _M(""))
+    PACK_CHANNEL_PARAMS(0, 1, _M("BaseColor"))
+    PACK_CHANNEL_PARAMS(1, 2, _M(""))
+    PACK_CHANNEL_PARAMS(2, 3, _M(""))
+    PACK_CHANNEL_PARAMS(3, 4, _M(""))
+    PACK_CHANNEL_PARAMS(4, 5, _M(""))
+    PACK_CHANNEL_PARAMS(5, 6, _M(""))
     kMapTiles, _M("mapTiles"), TYPE_INT_TAB, 0, P_VARIABLE_SIZE, IDS_MAP_TILES,
         p_end,
     kMapChannels, _M("mapChannels"), TYPE_INT_TAB, 0, P_VARIABLE_SIZE, IDS_MAP_CHANNELS,

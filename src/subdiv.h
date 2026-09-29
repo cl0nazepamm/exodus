@@ -1,4 +1,4 @@
-// udimpacker - Catmull-Clark subdivision, forward and reverse.
+// Exodus - Catmull-Clark subdivision, forward and reverse.
 //
 // Reverse subdivision recognises the structure one Catmull-Clark step leaves behind (every original
 // face became a fan of quads around a face vertex, every original edge got a midpoint vertex) and
@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-#include "udimpacker.h"
+#include "exodus.h"
 
 struct UnsubdivideOptions {
     int levels = 1;

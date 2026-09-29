@@ -1,4 +1,4 @@
-// udimpacker - background bleed. Every pixel no island owns is filled ring by ring from the
+// Exodus - background bleed. Every pixel no island owns is filled ring by ring from the
 // islands outward (each new pixel = average of its already-filled 8-neighbours), so the atlas
 // has no solid background for mips or bilinear filtering to pull in.
 #pragma once

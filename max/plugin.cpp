@@ -1,7 +1,7 @@
-// udimpacker for 3ds Max 2027: the plugin Max loads at startup. It registers the modifiers,
-// publishes the `udimpacker` MAXScript interface and hands the work to udimpacker_maxcore.dll.
+// Exodus for 3ds Max 2027: the plugin Max loads at startup. It registers the modifiers,
+// publishes the `exodus` MAXScript interface and hands the work to exodus_maxcore.dll.
 // That DLL is loaded from a copy in the temp folder, so a rebuild can replace it while Max runs
-// and udimpacker.reload() picks up the new one without a restart.
+// and exodus.reload() picks up the new one without a restart.
 #include <gup.h>
 #include <ifnpub.h>
 #include <Util/MainThreadTaskManager.h>
@@ -23,18 +23,18 @@ const Class_ID kGupClassId(0x61d84c2a, 0x3f0b7e95);
 const Interface_ID kInterfaceId(0x2b7e5d31, 0x46c19a08);
 
 // The core DLL: next to the plugin's folder in the build tree (../core), or where the
-// UDIMPACKER_MAXCORE environment variable points.
+// EXODUS_MAXCORE environment variable points.
 fs::path core_source() {
     wchar_t buf[MAX_PATH];
-    if (DWORD n = GetEnvironmentVariableW(L"UDIMPACKER_MAXCORE", buf, MAX_PATH); n && n < MAX_PATH) return fs::path(buf);
+    if (DWORD n = GetEnvironmentVariableW(L"EXODUS_MAXCORE", buf, MAX_PATH); n && n < MAX_PATH) return fs::path(buf);
     const DWORD n = GetModuleFileNameW(hInstance, buf, MAX_PATH);
-    return fs::path(std::wstring(buf, n)).parent_path().parent_path() / L"core" / L"udimpacker_maxcore.dll";
+    return fs::path(std::wstring(buf, n)).parent_path().parent_path() / L"core" / L"exodus_maxcore.dll";
 }
 
 struct Core {
     std::mutex lock;
     HMODULE module = nullptr;
-    const UdimCoreApi* api = nullptr;
+    const ExodusCoreApi* api = nullptr;
     fs::path copy;
     MSTR loadedFrom, error;
 
@@ -52,13 +52,13 @@ struct Core {
         error = _M("");
         const fs::path src = core_source();
         std::error_code ec;
-        const fs::path dir = fs::temp_directory_path(ec) / L"udimpacker";
+        const fs::path dir = fs::temp_directory_path(ec) / L"exodus";
         fs::create_directories(dir, ec);
         for (const auto& old : fs::directory_iterator(dir, ec)) {  // copies left behind; loaded ones stay locked
             std::error_code ignore;
             fs::remove(old.path(), ignore);
         }
-        copy = dir / (L"udimpacker_maxcore-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L".dll");
+        copy = dir / (L"exodus_maxcore-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L".dll");
         if (!fs::copy_file(src, copy, fs::copy_options::overwrite_existing, ec)) {
             error = MSTR(_M("cannot copy ")) + src.c_str() + _M(": ") + MSTR::FromACP(ec.message().c_str());
             copy.clear();
@@ -69,10 +69,10 @@ struct Core {
             error = MSTR(_M("cannot load ")) + copy.c_str();
             return false;
         }
-        const auto fn = reinterpret_cast<UdimCoreApiFn>(GetProcAddress(module, UDIM_CORE_API_EXPORT));
+        const auto fn = reinterpret_cast<ExodusCoreApiFn>(GetProcAddress(module, EXODUS_CORE_API_EXPORT));
         api = fn ? fn() : nullptr;
-        if (!api || api->version != kUdimCoreApiVersion) {
-            error = MSTR(src.c_str()) + _M(" is not a udimpacker core of interface version ") + MSTR::FromACP(std::to_string(kUdimCoreApiVersion).c_str());
+        if (!api || api->version != kExodusCoreApiVersion) {
+            error = MSTR(src.c_str()) + _M(" is not a Exodus core of interface version ") + MSTR::FromACP(std::to_string(kExodusCoreApiVersion).c_str());
             unload();
             return false;
         }
@@ -80,7 +80,7 @@ struct Core {
         return true;
     }
 
-    const UdimCoreApi* get() {
+    const ExodusCoreApi* get() {
         std::lock_guard guard(lock);
         return api || load() ? api : nullptr;
     }
@@ -90,16 +90,16 @@ struct Core {
 template <class F>
 MSTR collect(F&& call) {
     std::string text;
-    UdimSink sink{[](void* ctx, const char* s, size_t n) { static_cast<std::string*>(ctx)->append(s, n); }, &text};
+    ExodusSink sink{[](void* ctx, const char* s, size_t n) { static_cast<std::string*>(ctx)->append(s, n); }, &text};
     call(sink);
     return MSTR::FromUTF8(text.c_str());
 }
 
 MSTR json_error(const MSTR& what) { return MSTR(_M("{\"error\": \"")) + what + _M("\"}"); }
 
-class UdimInterface : public FPStaticInterface {
+class ExodusInterface : public FPStaticInterface {
 public:
-    DECLARE_DESCRIPTOR(UdimInterface)
+    DECLARE_DESCRIPTOR(ExodusInterface)
     enum { kVersion, kReload, kInspect, kSync, kBake };
 
     BEGIN_FUNCTION_MAP
@@ -118,9 +118,9 @@ public:
     void Sync() { IMainThreadTaskManager::GetInstance()->ExecutePendingTasks(); }
 
     MSTR Version() {
-        const UdimCoreApi* api = udim_core();
-        if (!api) return udim_core_error();
-        return MSTR(_M("udimpacker core ")) + MSTR::FromUTF8(api->build) + _M(" from ") + core.loadedFrom;
+        const ExodusCoreApi* api = exodus_core();
+        if (!api) return exodus_core_error();
+        return MSTR(_M("Exodus core ")) + MSTR::FromUTF8(api->build) + _M(" from ") + core.loadedFrom;
     }
 
     MSTR Reload() {
@@ -136,51 +136,51 @@ public:
 
     MSTR Inspect(INode* node) {
         if (!node) return json_error(_M("no node"));
-        const UdimCoreApi* api = udim_core();
-        if (!api) return json_error(udim_core_error());
-        return collect([&](UdimSink sink) { api->inspect(node, sink); });
+        const ExodusCoreApi* api = exodus_core();
+        if (!api) return json_error(exodus_core_error());
+        return collect([&](ExodusSink sink) { api->inspect(node, sink); });
     }
 };
 
 // clang-format off
-UdimInterface theInterface(kInterfaceId, _M("udimpacker"), 0, nullptr, FP_CORE,
-    UdimInterface::kVersion, _M("version"), 0, TYPE_TSTR_BV, FP_NO_REDRAW, 0,
-    UdimInterface::kReload, _M("reload"), 0, TYPE_TSTR_BV, FP_NO_REDRAW, 0,
-    UdimInterface::kInspect, _M("inspect"), 0, TYPE_TSTR_BV, FP_NO_REDRAW, 1,
+ExodusInterface theInterface(kInterfaceId, _M("exodus"), 0, nullptr, FP_CORE,
+    ExodusInterface::kVersion, _M("version"), 0, TYPE_TSTR_BV, FP_NO_REDRAW, 0,
+    ExodusInterface::kReload, _M("reload"), 0, TYPE_TSTR_BV, FP_NO_REDRAW, 0,
+    ExodusInterface::kInspect, _M("inspect"), 0, TYPE_TSTR_BV, FP_NO_REDRAW, 1,
         _M("node"), 0, TYPE_INODE,
-    UdimInterface::kSync, _M("sync"), 0, TYPE_VOID, 0, 0,
-    UdimInterface::kBake, _M("bake"), 0, TYPE_TSTR_BV, 0, 1,
+    ExodusInterface::kSync, _M("sync"), 0, TYPE_VOID, 0, 0,
+    ExodusInterface::kBake, _M("bake"), 0, TYPE_TSTR_BV, 0, 1,
         _M("modifier"), 0, TYPE_REFTARG,
     p_end);
 // clang-format on
 
 // A global utility plugin whose only job is to keep this DLL loaded from startup on.
-class UdimGup : public GUP {
+class ExodusGup : public GUP {
 public:
     DWORD Start() override { return GUPRESULT_KEEP; }
     void Stop() override { core.unload(); }
     void DeleteThis() override { delete this; }
 };
 
-class UdimGupClassDesc : public ClassDesc2 {
+class ExodusGupClassDesc : public ClassDesc2 {
 public:
     int IsPublic() override { return FALSE; }
-    void* Create(BOOL) override { return new UdimGup; }
-    // Not "udimpacker": MAXScript would resolve that name to this class instead of the interface.
-    const MCHAR* ClassName() override { return _M("udimpackerStartup"); }
-    const MCHAR* NonLocalizedClassName() override { return _M("udimpackerStartup"); }
+    void* Create(BOOL) override { return new ExodusGup; }
+    // Not "exodus": MAXScript would resolve that name to this class instead of the interface.
+    const MCHAR* ClassName() override { return _M("exodusStartup"); }
+    const MCHAR* NonLocalizedClassName() override { return _M("exodusStartup"); }
     SClass_ID SuperClassID() override { return GUP_CLASS_ID; }
     Class_ID ClassID() override { return kGupClassId; }
-    const MCHAR* Category() override { return _M("udimpacker"); }
-    const MCHAR* InternalName() override { return _M("udimpackerStartup"); }
+    const MCHAR* Category() override { return _M("Exodus"); }
+    const MCHAR* InternalName() override { return _M("exodusStartup"); }
     HINSTANCE HInstance() override { return hInstance; }
 };
 
-UdimGupClassDesc gupDesc;
+ExodusGupClassDesc gupDesc;
 
 }  // namespace
 
-const MCHAR* udim_string(int id) {  // one stored string per id: Max may keep the pointer
+const MCHAR* exodus_string(int id) {  // one stored string per id: Max may keep the pointer
     static std::map<int, MSTR> strings;
     auto [it, fresh] = strings.try_emplace(id);
     if (fresh) {
@@ -190,14 +190,14 @@ const MCHAR* udim_string(int id) {  // one stored string per id: Max may keep th
     return it->second.data();
 }
 
-const UdimCoreApi* udim_core() { return core.get(); }
+const ExodusCoreApi* exodus_core() { return core.get(); }
 
-const UdimCoreApi* udim_core_loaded() {
+const ExodusCoreApi* exodus_core_loaded() {
     std::lock_guard guard(core.lock);
     return core.api;
 }
 
-MSTR udim_core_error() { return MSTR(_M("udimpacker core: ")) + core.error; }
+MSTR exodus_core_error() { return MSTR(_M("Exodus core: ")) + core.error; }
 
 BOOL WINAPI DllMain(HINSTANCE instance, ULONG reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
@@ -207,7 +207,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, ULONG reason, LPVOID) {
     return TRUE;
 }
 
-__declspec(dllexport) const MCHAR* LibDescription() { return _M("udimpacker: unsubdivide, decimate and UDIM packing"); }
+__declspec(dllexport) const MCHAR* LibDescription() { return _M("Exodus: unsubdivide, decimate and UDIM packing"); }
 __declspec(dllexport) int LibNumberClasses() { return 4; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {

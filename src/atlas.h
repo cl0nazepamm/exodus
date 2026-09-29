@@ -1,4 +1,4 @@
-// udimpacker - the packing pipeline: bind the maps of every material, cut the UV islands out of
+// Exodus - the packing pipeline: bind the maps of every material, cut the UV islands out of
 // their source pixels, pack them into one atlas, and compose the atlas channel by channel (copy,
 // verify, bleed, write). Shared by the command-line tool and the 3ds Max plugin.
 #pragma once
@@ -14,7 +14,7 @@
 #include "image.h"
 #include "pack.h"
 #include "subdiv.h"
-#include "udimpacker.h"
+#include "exodus.h"
 
 struct PackOptions {
     std::string input, outDir, prefix, uvSet;

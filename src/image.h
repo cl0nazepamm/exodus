@@ -1,4 +1,4 @@
-// udimpacker - minimal image container and I/O. Samples are stored at their native depth
+// Exodus - minimal image container and I/O. Samples are stored at their native depth
 // (8 or 16 bit) and channel count (1-4); nothing is color-converted.
 #pragma once
 

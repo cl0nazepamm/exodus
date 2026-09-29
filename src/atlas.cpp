@@ -1,4 +1,4 @@
-// udimpacker - the packing pipeline (see atlas.h).
+// Exodus - the packing pipeline (see atlas.h).
 #include "atlas.h"
 
 #include <algorithm>
@@ -779,7 +779,7 @@ void Packer::write_obj(const std::string& previewFile) {
     }
     FILE* f = _wfopen((dir / upath(o.prefix + ".obj")).c_str(), L"wb");
     if (!f) return;
-    std::fprintf(f, "# udimpacker preview: packed UVs, one material\nmtllib %s.mtl\n", o.prefix.c_str());
+    std::fprintf(f, "# Exodus preview: packed UVs, one material\nmtllib %s.mtl\n", o.prefix.c_str());
     size_t vBase = 1, vtBase = 1, vnBase = 1;
     std::string buf;
     char line[256];

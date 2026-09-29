@@ -1,4 +1,4 @@
-// udimpacker - true-shape raster packer. Islands are packed by their dilated pixel footprint,
+// Exodus - true-shape raster packer. Islands are packed by their dilated pixel footprint,
 // not their bounding box, on a coarse cell grid. Rotations are quarter turns only, so every
 // placement stays on the pixel grid.
 #pragma once

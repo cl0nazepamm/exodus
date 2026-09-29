@@ -1,4 +1,4 @@
-// udimpacker for 3ds Max: the reducing modifiers, Unsubdivide and Decimate. Both sit below Skin
+// Exodus for 3ds Max: the reducing modifiers, Unsubdivide and Decimate. Both sit below Skin
 // and keep only input vertices at their input positions; the work (plan, result, Skin weight
 // copy) is in the core DLL (see maxcore.cpp for why Skin keeps its weights). This part holds the
 // parameters and the per-node state, queues the Skin weight update for after the evaluation, and
@@ -30,7 +30,7 @@ bool is_reducer(Modifier* m) { return instances.count(m) > 0; }
 
 class ReduceData : public LocalModData {
 public:
-    UdimReduceState state;
+    ExodusReduceState state;
     LocalModData* Clone() override { return new ReduceData(*this); }
 };
 
@@ -50,16 +50,16 @@ public:
     virtual int NameId() const = 0;
     virtual const MCHAR* Name() const = 0;
     // One evaluation: read the parameters and call the core.
-    virtual bool Run(const UdimCoreApi& core, TimeValue t, Interval& valid, ModContext& mc, INode* node, MNMesh& mesh,
-                     UdimReduceState& state, std::wstring& text, INode*& owner) = 0;
+    virtual bool Run(const ExodusCoreApi& core, TimeValue t, Interval& valid, ModContext& mc, INode* node, MNMesh& mesh,
+                     ExodusReduceState& state, std::wstring& text, INode*& owner) = 0;
 
     // Animatable
     void DeleteThis() override { delete this; }
-    void GetClassName(MSTR& s, bool localized) const override { s = localized ? udim_string(NameId()) : Name(); }
+    void GetClassName(MSTR& s, bool localized) const override { s = localized ? exodus_string(NameId()) : Name(); }
     Class_ID ClassID() override { return Desc().ClassID(); }
     int NumSubs() override { return 1; }
     Animatable* SubAnim(int) override { return pblock; }
-    MSTR SubAnimName(int, bool localized) override { return localized ? udim_string(IDS_PARAMETERS) : _M("Parameters"); }
+    MSTR SubAnimName(int, bool localized) override { return localized ? exodus_string(IDS_PARAMETERS) : _M("Parameters"); }
     int NumParamBlocks() override { return 1; }
     IParamBlock2* GetParamBlock(int) override { return pblock; }
     IParamBlock2* GetParamBlockByID(BlockID id) override { return pblock && pblock->ID() == id ? pblock : nullptr; }
@@ -82,7 +82,7 @@ protected:
 
 public:
     // BaseObject / Modifier
-    const MCHAR* GetObjectName(bool localized) const override { return localized ? udim_string(NameId()) : Name(); }
+    const MCHAR* GetObjectName(bool localized) const override { return localized ? exodus_string(NameId()) : Name(); }
     CreateMouseCallBack* GetCreateMouseCallBack() override { return nullptr; }
     BOOL ChangeTopology() override { return TRUE; }
     ChannelMask ChannelsUsed() override { return GEOM_CHANNEL | TOPO_CHANNEL | TEXMAP_CHANNEL | VERTCOLOR_CHANNEL | SELECT_CHANNEL | SUBSEL_TYPE_CHANNEL; }
@@ -96,13 +96,13 @@ public:
         Interval valid = FOREVER;
         auto* data = static_cast<ReduceData*>(mc.localData);
         if (!data) mc.localData = data = new ReduceData;
-        if (const UdimCoreApi* core = udim_core()) {
+        if (const ExodusCoreApi* core = exodus_core()) {
             std::wstring text;
             INode* owner = nullptr;
             if (Run(*core, t, valid, mc, node, po->GetMesh(), data->state, text, owner) && !data->state.pending) post_weights(owner, this, *data);
             status = text.c_str();
         } else {
-            status = udim_core_error();
+            status = exodus_core_error();
         }
         ShowStatus();
         po->UpdateValidity(GEOM_CHAN_NUM, valid);
@@ -138,11 +138,11 @@ public:
     ReduceClassDesc(Class_ID id, const MCHAR* name, const MCHAR* internal) : id(id), name(name), internal(internal) {}
     int IsPublic() override { return TRUE; }
     void* Create(BOOL) override { return new Mod; }
-    const MCHAR* ClassName() override { return udim_string(kName); }
+    const MCHAR* ClassName() override { return exodus_string(kName); }
     const MCHAR* NonLocalizedClassName() override { return name; }
     SClass_ID SuperClassID() override { return OSM_CLASS_ID; }
     Class_ID ClassID() override { return id; }
-    const MCHAR* Category() override { return udim_string(IDS_CATEGORY); }
+    const MCHAR* Category() override { return exodus_string(IDS_CATEGORY); }
     const MCHAR* InternalName() override { return internal; }
     HINSTANCE HInstance() override { return hInstance; }
 
@@ -161,17 +161,17 @@ public:
     ParamBlockDesc2& PbDesc() const override;
     int NameId() const override { return IDS_UNSUBDIVIDE; }
     const MCHAR* Name() const override { return _M("Unsubdivide"); }
-    bool Run(const UdimCoreApi& core, TimeValue t, Interval& valid, ModContext& mc, INode* node, MNMesh& mesh, UdimReduceState& state,
+    bool Run(const ExodusCoreApi& core, TimeValue t, Interval& valid, ModContext& mc, INode* node, MNMesh& mesh, ExodusReduceState& state,
              std::wstring& text, INode*& owner) override {
         int levels = 1;
         BOOL symmetry = TRUE;
         pblock->GetValue(kLevels, t, levels, valid);
         pblock->GetValue(kSymmetry, t, symmetry, valid);
-        return core.unsubdivide_modify(this, mc, node, mesh, UdimUnsubdivide{levels, symmetry != FALSE}, state, is_reducer, text, owner);
+        return core.unsubdivide_modify(this, mc, node, mesh, ExodusUnsubdivide{levels, symmetry != FALSE}, state, is_reducer, text, owner);
     }
 };
 
-ReduceClassDesc<UnsubdivideMod, IDS_UNSUBDIVIDE> unsubdivideDesc(kUnsubdivideClassId, _M("Unsubdivide"), _M("udimUnsubdivide"));
+ReduceClassDesc<UnsubdivideMod, IDS_UNSUBDIVIDE> unsubdivideDesc(kUnsubdivideClassId, _M("Unsubdivide"), _M("exodusUnsubdivide"));
 
 // clang-format off
 ParamBlockDesc2 unsubdividePbDesc(kParams, _M("parameters"), IDS_PARAMETERS, &unsubdivideDesc, P_AUTO_CONSTRUCT + P_AUTO_UI, 0,
@@ -201,17 +201,17 @@ public:
     ParamBlockDesc2& PbDesc() const override;
     int NameId() const override { return IDS_DECIMATE; }
     const MCHAR* Name() const override { return _M("Decimate"); }
-    bool Run(const UdimCoreApi& core, TimeValue t, Interval& valid, ModContext& mc, INode* node, MNMesh& mesh, UdimReduceState& state,
+    bool Run(const ExodusCoreApi& core, TimeValue t, Interval& valid, ModContext& mc, INode* node, MNMesh& mesh, ExodusReduceState& state,
              std::wstring& text, INode*& owner) override {
         float percent = 50;
         BOOL lockBorder = FALSE;
         pblock->GetValue(kPercent, t, percent, valid);
         pblock->GetValue(kLockBorder, t, lockBorder, valid);
-        return core.decimate_modify(this, mc, node, mesh, UdimDecimate{percent, lockBorder != FALSE}, state, is_reducer, text, owner);
+        return core.decimate_modify(this, mc, node, mesh, ExodusDecimate{percent, lockBorder != FALSE}, state, is_reducer, text, owner);
     }
 };
 
-ReduceClassDesc<DecimateMod, IDS_DECIMATE> decimateDesc(kDecimateClassId, _M("Decimate"), _M("udimDecimate"));
+ReduceClassDesc<DecimateMod, IDS_DECIMATE> decimateDesc(kDecimateClassId, _M("Decimate"), _M("exodusDecimate"));
 
 // clang-format off
 ParamBlockDesc2 decimatePbDesc(kParams, _M("parameters"), IDS_PARAMETERS, &decimateDesc, P_AUTO_CONSTRUCT + P_AUTO_UI, 0,
@@ -256,13 +256,13 @@ public:
         INode* n = GetCOREInterface()->GetINodeByHandle(node);
         const auto reducers = reducers_on(n);
         ReduceData* data = nullptr;
-        std::vector<UdimSkinCopy*> below;  // copies of the reducers under this one
+        std::vector<ExodusSkinCopy*> below;  // copies of the reducers under this one
         for (const auto& [m, d] : reducers) {
             if (m == mod) data = d;
             else if (data && !d->state.skin.empty()) below.push_back(&d->state.skin);
         }
         if (!data) return;
-        const UdimCoreApi* core = udim_core();
+        const ExodusCoreApi* core = exodus_core();
         const bool changed = core && core->write_weights(n, mod, data->state, below);  // `pending` holds off new posts meanwhile
         data->state.pending = false;
         if (changed) {
@@ -287,7 +287,7 @@ void post_weights(INode* node, Modifier* mod, ReduceData& data) {
 IOResult ReduceMod::SaveLocalData(ISave* isave, LocalModData* ld) {
     auto* data = static_cast<ReduceData*>(ld);
     if (!data || data->state.skin.empty()) return IO_OK;
-    const UdimSkinCopy& c = data->state.skin;
+    const ExodusSkinCopy& c = data->state.skin;
     ULONG written;
     isave->BeginChunk(kChunkBones);
     for (size_t i = 0; i < c.bones.size(); ++i) {
@@ -300,7 +300,7 @@ IOResult ReduceMod::SaveLocalData(ISave* isave, LocalModData* ld) {
     const uint32_t nv = (uint32_t)c.pos.size(), nw = (uint32_t)c.bone.size();
     isave->Write(&nv, sizeof nv, &written);
     isave->Write(&nw, sizeof nw, &written);
-    isave->Write(reinterpret_cast<const float*>(c.pos.data()), (ULONG)(nv * sizeof(UdimPos)), &written);
+    isave->Write(reinterpret_cast<const float*>(c.pos.data()), (ULONG)(nv * sizeof(ExodusPos)), &written);
     isave->Write(c.first.data(), (ULONG)(c.first.size() * sizeof(uint32_t)), &written);
     isave->Write(c.bone.data(), (ULONG)(nw * sizeof(uint32_t)), &written);
     isave->Write(c.weight.data(), (ULONG)(nw * sizeof(float)), &written);
@@ -309,7 +309,7 @@ IOResult ReduceMod::SaveLocalData(ISave* isave, LocalModData* ld) {
         isave->BeginChunk(kChunkSynced);
         const uint32_t ns = (uint32_t)c.synced.size();
         isave->Write(&ns, sizeof ns, &written);
-        isave->Write(reinterpret_cast<const float*>(c.synced.data()), (ULONG)(ns * sizeof(UdimPos)), &written);
+        isave->Write(reinterpret_cast<const float*>(c.synced.data()), (ULONG)(ns * sizeof(ExodusPos)), &written);
         isave->EndChunk();
     }
     return IO_OK;
@@ -318,7 +318,7 @@ IOResult ReduceMod::SaveLocalData(ISave* isave, LocalModData* ld) {
 IOResult ReduceMod::LoadLocalData(ILoad* iload, LocalModData** pld) {
     auto* data = new ReduceData;
     *pld = data;
-    UdimSkinCopy& c = data->state.skin;
+    ExodusSkinCopy& c = data->state.skin;
     ULONG read;
     IOResult res;
     while ((res = iload->OpenChunk()) == IO_OK) {
@@ -341,7 +341,7 @@ IOResult ReduceMod::LoadLocalData(ILoad* iload, LocalModData** pld) {
             c.first.resize(nv + 1);
             c.bone.resize(nw);
             c.weight.resize(nw);
-            iload->Read(reinterpret_cast<float*>(c.pos.data()), (ULONG)(nv * sizeof(UdimPos)), &read);
+            iload->Read(reinterpret_cast<float*>(c.pos.data()), (ULONG)(nv * sizeof(ExodusPos)), &read);
             iload->Read(c.first.data(), (ULONG)(c.first.size() * sizeof(uint32_t)), &read);
             iload->Read(c.bone.data(), (ULONG)(nw * sizeof(uint32_t)), &read);
             iload->Read(c.weight.data(), (ULONG)(nw * sizeof(float)), &read);
@@ -351,7 +351,7 @@ IOResult ReduceMod::LoadLocalData(ILoad* iload, LocalModData** pld) {
             uint32_t ns = 0;
             iload->Read(&ns, sizeof ns, &read);
             c.synced.resize(ns);
-            iload->Read(reinterpret_cast<float*>(c.synced.data()), (ULONG)(ns * sizeof(UdimPos)), &read);
+            iload->Read(reinterpret_cast<float*>(c.synced.data()), (ULONG)(ns * sizeof(ExodusPos)), &read);
             c.inSync = true;
             break;
         }

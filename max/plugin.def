@@ -1,4 +1,4 @@
-LIBRARY udimpacker.gup
+LIBRARY exodus.gup
 EXPORTS
    LibDescription       @1       PRIVATE
    LibNumberClasses     @2       PRIVATE
