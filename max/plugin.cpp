@@ -19,8 +19,8 @@ namespace {
 
 namespace fs = std::filesystem;
 
-const Class_ID kGupClassId(0x61d84c2a, 0x3f0b7e95);
-const Interface_ID kInterfaceId(0x2b7e5d31, 0x46c19a08);
+const Class_ID kGupClassId(0xf7a5502e, 0xb8de92d3);
+const Interface_ID kInterfaceId(0x74ca25bc, 0x7565e9b0);
 
 // The core DLL: next to the plugin's folder in the build tree (../core), or where the
 // EXODUS_MAXCORE environment variable points.

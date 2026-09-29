@@ -19,7 +19,7 @@
 
 namespace {
 
-const Class_ID kPackClassId(0x5c2e8a17, 0x0b94d3f6);
+const Class_ID kPackClassId(0xdcdf3ee7, 0x9ad18e13);
 
 enum { kParams };
 enum : ParamID {

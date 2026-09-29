@@ -15,8 +15,8 @@
 
 namespace {
 
-const Class_ID kUnsubdivideClassId(0x4a3f19c2, 0x7de20b61);
-const Class_ID kDecimateClassId(0x19b4e6d3, 0x2c85a47f);
+const Class_ID kUnsubdivideClassId(0xb3ea3d05, 0x9f0b4206);
+const Class_ID kDecimateClassId(0x14524858, 0xf249c598);
 
 enum { kParams };
 enum { kLevels, kSymmetry };        // Unsubdivide
