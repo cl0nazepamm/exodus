@@ -621,12 +621,13 @@ void rebuild_mesh(InMesh& m, const FaceSet& fs, const Level& R) {
     out.positions = std::move(m.positions);
     out.normals = std::move(m.normals);
     out.uvs = std::move(m.uvs);
-    const bool hasN = !m.cornerNrm.empty();
+    const bool hasN = !m.cornerNrm.empty(), hasSrc = !m.cornerSrc.empty();
     auto corner = [&](uint32_t c) {
         const uint32_t oc = fs.srcCorner[c];
         out.cornerPos.push_back(m.cornerPos[oc]);
         out.cornerUv.push_back(m.cornerUv[oc]);
         if (hasN) out.cornerNrm.push_back(m.cornerNrm[oc]);
+        if (hasSrc) out.cornerSrc.push_back(m.cornerSrc[oc]);
     };
     for (uint32_t f = 0; f < m.faces.size(); ++f) {
         if (!R.faceKept[f]) continue;
@@ -820,9 +821,9 @@ struct DissolveResult {
 };
 
 DissolveResult dissolve_level(InMesh& m, const std::vector<uint8_t>& lockedMaterial, bool symmetric) {
-    struct Corner { uint32_t pos, uv, nrm; };
+    struct Corner { uint32_t pos, uv, nrm, src; };
     struct Face { std::vector<Corner> c; uint32_t material = 0; bool dead = false; };
-    const bool hasN = !m.cornerNrm.empty();
+    const bool hasN = !m.cornerNrm.empty(), hasSrc = !m.cornerSrc.empty();
     const uint32_t nv = (uint32_t)m.positions.size();
     DissolveResult res;
     const std::vector<uint32_t> mir = symmetric ? find_mirror(m, res.axis) : std::vector<uint32_t>(nv, kNone);
@@ -831,7 +832,7 @@ DissolveResult dissolve_level(InMesh& m, const std::vector<uint8_t>& lockedMater
     for (uint32_t f = 0; f < m.faces.size(); ++f) {
         faces[f].material = m.faces[f].material;
         for (uint32_t c = m.faces[f].first; c < m.faces[f].first + m.faces[f].count; ++c) {
-            faces[f].c.push_back({m.cornerPos[c], m.cornerUv[c], hasN ? m.cornerNrm[c] : 0});
+            faces[f].c.push_back({m.cornerPos[c], m.cornerUv[c], hasN ? m.cornerNrm[c] : 0, hasSrc ? m.cornerSrc[c] : 0});
             vertFaces[m.cornerPos[c]].push_back(f);
         }
     }
@@ -1266,6 +1267,7 @@ DissolveResult dissolve_level(InMesh& m, const std::vector<uint8_t>& lockedMater
             out.cornerPos.push_back(c.pos);
             out.cornerUv.push_back(c.uv);
             if (hasN) out.cornerNrm.push_back(c.nrm);
+            if (hasSrc) out.cornerSrc.push_back(c.src);
         }
     }
     compact(out);
