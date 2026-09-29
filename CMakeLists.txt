@@ -11,6 +11,7 @@ target_include_directories(meshoptimizer PUBLIC third_party/meshoptimizer)
 
 # The DCC-neutral core, shared by the command-line tool and the 3ds Max plugin.
 add_library(udimpacker_core STATIC
+    src/atlas.cpp
     src/image.cpp
     src/pack.cpp
     src/bleed.cpp
