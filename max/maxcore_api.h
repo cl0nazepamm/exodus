@@ -70,6 +70,33 @@ struct UdimReduceState {
 
 using UdimIsReducer = bool (*)(Modifier*);
 
+// UDIM Pack: the maps are given per tile by hand (no guessing from materials). Tiles with at
+// least one map are packed into one atlas; faces in other tiles keep their UVs.
+constexpr int kUdimPackChannels = 6;
+
+struct UdimPackMap {
+    int tile = 1001;     // UDIM number
+    int channel = 0;     // 0 .. kUdimPackChannels - 1
+    std::wstring file;
+};
+
+struct UdimPackSettings {
+    int sourceChannel = 1, targetChannel = 2;  // map channels: packed UVs are read from / written to
+    int size = 0;                              // atlas width and height; 0 = smallest that fits
+    int maxSize = 8192;
+    int padding = 8;
+    bool rotate = true;
+    std::wstring channel[kUdimPackChannels];   // names (atlas file suffix); empty = unused
+    int kind[kUdimPackChannels] = {};          // 0 color, 1 normal map OpenGL (Y+), 2 normal map DirectX (Y-)
+    std::vector<UdimPackMap> maps;
+    std::wstring outDir, prefix;               // where Bake writes; outDir empty = <scene folder>\udimpacker
+};
+
+struct UdimPackTile {
+    int tile = 1001;
+    int faces = 0;  // faces of all parts in this tile (source UVs)
+};
+
 struct UdimCoreApi {
     int version;        // kUdimCoreApiVersion of the DLL; the plugin refuses any other
     const char* build;  // build stamp of the DLL
@@ -91,9 +118,22 @@ struct UdimCoreApi {
     // `below` are the weight copies of the reducing modifiers further down the stack, looked up for
     // a vertex this modifier's own copy does not have. Returns true when Skin was brought in step.
     bool (*write_weights)(INode* node, Modifier* self, UdimReduceState& state, const std::vector<UdimSkinCopy*>& below);
+
+    // UDIM Pack's ModifyObject. One modifier instance is shared by all parts of a character, so
+    // the layout is made from every node the modifier sits on (the others are evaluated below the
+    // modifier when their input is not known yet) and kept in the core per modifier. Writes the
+    // packed UVs of this node into the target channel; `tiles` gets the UDIM tiles in use. Returns
+    // true when the layout changed, so the other nodes need to evaluate again.
+    bool (*pack_modify)(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, const UdimPackSettings& settings,
+                        std::wstring& status, std::vector<UdimPackTile>& tiles);
+    // Writes the atlas maps, layout image and manifest. Re-reads every node first; `relayout` is
+    // set when that changed the layout (the nodes then need to evaluate again). `log` gets the
+    // whole report.
+    bool (*pack_bake)(Modifier* self, const UdimPackSettings& settings, UdimSink log, std::wstring& status, bool& relayout);
+    void (*pack_forget)(Modifier* self);  // the modifier is gone: drop its layout
 };
 
-constexpr int kUdimCoreApiVersion = 5;
+constexpr int kUdimCoreApiVersion = 6;
 
 // The one export of udimpacker_maxcore.dll.
 extern "C" typedef const UdimCoreApi* (*UdimCoreApiFn)();

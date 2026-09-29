@@ -12,12 +12,16 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "atlas.h"
 #include "decimate.h"
 #include "maxcore_api.h"
 #include "subdiv.h"
@@ -833,7 +837,483 @@ bool write_weights(INode* node, Modifier* self, UdimReduceState& st, const std::
     return true;
 }
 
-const UdimCoreApi kApi{kUdimCoreApiVersion, kBuild, inspect, unsubdivide_modify, decimate_modify, write_weights};
+// ------------------------------------------------------------------------------------------------
+// UDIM Pack. One modifier instance sits on every part of a character and the layout is made from
+// all of them, so it is kept here per modifier and each part's evaluation writes its share. The
+// maps come per UDIM tile from the settings: every tile with maps becomes one material of the
+// packer's scene, faces in other tiles are left out. Materials in the scene are not read.
+
+// One node's input: the faces and source UVs the layout is made from.
+struct PackPart {
+    uint64_t signature = 0;  // source channel, face degrees and triangles, map faces and values
+    int channel = 0;
+    InMesh mesh;             // faces (materials set when the scene is put together), source UVs, triangles
+    std::vector<UVVert> uvw; // the source map's values, w included
+};
+
+struct PackUVs {  // one node's packed UVs
+    std::vector<UVVert> verts;
+    std::vector<int> tv;  // per corner of the live faces in order
+};
+
+struct PackState {
+    std::map<ULONG, PackPart> parts;  // by node handle
+    uint64_t layout = 0;              // the signature the layout below was made for
+    bool ok = false;
+    std::unique_ptr<Packer> packer;
+    std::map<ULONG, PackUVs> uvs;
+    std::string report, log;          // status line and the packer's report of the layout
+    std::vector<UdimPackTile> tiles;
+};
+
+std::recursive_mutex packLock;
+std::map<Modifier*, PackState> packs;
+std::set<Modifier*> packBusy;  // modifiers in the middle of pack_modify / pack_bake
+
+// Collects the packer's report (say) while alive.
+struct SayCapture {
+    static inline std::string* target = nullptr;
+    std::string* prevTarget;
+    void (*prevHook)(const char*);
+    explicit SayCapture(std::string& s) : prevTarget(target), prevHook(say_hook) {
+        target = &s;
+        say_hook = [](const char* text) { if (target) *target += text; };
+    }
+    ~SayCapture() {
+        target = prevTarget;
+        say_hook = prevHook;
+    }
+};
+
+void add_text(Fnv& h, const std::wstring& s) {
+    h.add(s.size());
+    for (wchar_t c : s) h.add((uint64_t)c);
+}
+
+// Where the modifier sits: every node whose stack holds it, by handle.
+struct PackUse {
+    INode* node;
+    IDerivedObject* owner;
+    int index;
+};
+
+std::vector<PackUse> uses_of(Modifier* mod) {
+    struct Nodes : DependentEnumProc {
+        std::vector<INode*> found;
+        int proc(ReferenceMaker* rm) override {
+            if (rm->SuperClassID() != BASENODE_CLASS_ID) return DEP_ENUM_CONTINUE;
+            found.push_back(static_cast<INode*>(rm));
+            return DEP_ENUM_SKIP;
+        }
+    } nodes;
+    mod->DoEnumDependents(&nodes);
+    std::vector<PackUse> uses;
+    for (INode* n : nodes.found) {
+        if (!n->GetParentNode()) continue;  // deleted (kept for undo)
+        bool found = false;
+        for (Object* obj = n->GetObjectRef(); obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID && !found;
+             obj = static_cast<IDerivedObject*>(obj)->GetObjRef()) {
+            auto* d = static_cast<IDerivedObject*>(obj);
+            for (int i = 0; i < d->NumModifiers() && !found; ++i)
+                if (d->GetModifier(i) == mod) {
+                    uses.push_back({n, d, i});
+                    found = true;
+                }
+        }
+    }
+    std::sort(uses.begin(), uses.end(), [](const PackUse& a, const PackUse& b) { return a.node->GetHandle() < b.node->GetHandle(); });
+    uses.erase(std::unique(uses.begin(), uses.end(), [](const PackUse& a, const PackUse& b) { return a.node == b.node; }), uses.end());
+    return uses;
+}
+
+bool make_part(MNMesh& m, int channel, PackPart& p, std::string& err) {
+    MNMap* map = channel >= 1 && channel < m.MNum() ? m.M(channel) : nullptr;
+    if (!map || map->GetFlag(MN_DEAD) || map->FNum() != m.FNum() || map->VNum() == 0) {
+        err = "no UVs in map channel " + std::to_string(channel);
+        return false;
+    }
+    const CornerTable ct = corners_of(m);
+    Fnv h;
+    h.add((uint64_t)channel);
+    p = {};
+    p.channel = channel;
+    p.uvw.assign(map->v, map->v + map->VNum());
+    h.add(p.uvw.size());
+    InMesh& im = p.mesh;
+    im.positions.resize(m.VNum());
+    for (int v = 0; v < m.VNum(); ++v) im.positions[v] = {m.P(v).x, m.P(v).y, m.P(v).z};
+    for (const UVVert& uv : p.uvw) {
+        im.uvs.push_back({uv.x, uv.y});
+        h.add(std::bit_cast<uint32_t>(uv.x));
+        h.add(std::bit_cast<uint32_t>(uv.y));
+        h.add(std::bit_cast<uint32_t>(uv.z));
+    }
+    Tab<int> tri;
+    for (size_t i = 0; i < ct.faces.size(); ++i) {
+        const int f = ct.faces[i];
+        MNFace* F = m.F(f);
+        const MNMapFace* mf = map->F(f);
+        if (mf->deg != F->deg) {
+            err = "map channel " + std::to_string(channel) + " does not match the faces";
+            return false;
+        }
+        im.faces.push_back({ct.first[i], (uint32_t)F->deg, 0});
+        h.add((uint64_t)F->deg);
+        for (int k = 0; k < F->deg; ++k) {
+            if (mf->tv[k] < 0 || mf->tv[k] >= map->VNum()) {
+                err = "map channel " + std::to_string(channel) + " has broken faces";
+                return false;
+            }
+            im.cornerPos.push_back((uint32_t)F->vtx[k]);
+            im.cornerUv.push_back((uint32_t)mf->tv[k]);
+            h.add((uint64_t)mf->tv[k]);
+        }
+        F->GetTriangles(tri);
+        for (int t = 0; t + 2 < tri.Count(); t += 3) {
+            im.tris.push_back({ct.first[i] + tri[t], ct.first[i] + tri[t + 1], ct.first[i] + tri[t + 2]});
+            im.triFace.push_back((uint32_t)i);
+            for (int k = 0; k < 3; ++k) h.add((uint64_t)tri[t + k]);
+        }
+    }
+    p.signature = h.h;
+    return true;
+}
+
+// A node's input, evaluated below the modifier.
+bool read_part(const PackUse& u, TimeValue t, int channel, PackPart& p, std::string& err) {
+    ObjectState os = u.index + 1 < u.owner->NumModifiers() ? u.owner->Eval(t, u.index + 1) : u.owner->GetObjRef()->Eval(t);
+    if (!os.obj || !os.obj->CanConvertToType(polyObjectClassID)) {
+        err = "not a mesh";
+        return false;
+    }
+    auto* po = static_cast<PolyObject*>(os.obj->ConvertToType(t, polyObjectClassID));
+    const bool ok = make_part(po->GetMesh(), channel, p, err);
+    if (po != os.obj) po->MaybeAutoDelete();
+    return ok;
+}
+
+// The tile of a face, as the packer finds it (the average of its UVs); -1 outside 1001 .. 1999.
+int face_udim(const InMesh& m, const InFace& f) {
+    double cu = 0, cv = 0;
+    for (uint32_t c = 0; c < f.count; ++c) {
+        const Vec2d& uv = m.uvs[m.cornerUv[f.first + c]];
+        cu += uv.x;
+        cv += uv.y;
+    }
+    const Tile t{(int)std::floor(cu / f.count), (int)std::floor(cv / f.count)};
+    return t.u >= 0 && t.u < 10 && t.v >= 0 && t.v < 100 ? udim_number(t) : -1;
+}
+
+uint64_t layout_signature(const PackState& st, const UdimPackSettings& s) {
+    Fnv h = settings_hash('P');
+    for (const auto& [handle, part] : st.parts) {
+        h.add(handle);
+        h.add(part.signature);
+    }
+    h.add((uint64_t)s.size);
+    h.add((uint64_t)s.maxSize);
+    h.add((uint64_t)s.padding);
+    h.add(s.rotate);
+    for (int c = 0; c < kUdimPackChannels; ++c) {
+        add_text(h, s.channel[c]);
+        h.add((uint64_t)s.kind[c]);
+    }
+    for (const UdimPackMap& m : s.maps) {
+        h.add((uint64_t)m.tile);
+        h.add((uint64_t)m.channel);
+        add_text(h, m.file);
+    }
+    return h.h;
+}
+
+// The packed UVs of the packer's mesh `mi`: new UVs for packed faces (one per source UV and
+// island, as in the CLI's OBJ), the source UVs for faces left out.
+PackUVs packed_uvs(const Packer& P, size_t mi, const PackPart& part) {
+    const InMesh& mesh = P.scene.meshes[mi];
+    PackUVs out;
+    std::unordered_map<uint64_t, int> index;
+    out.tv.reserve(mesh.cornerUv.size());
+    for (size_t fi = 0; fi < mesh.faces.size(); ++fi) {
+        const InFace& f = mesh.faces[fi];
+        const int isl = P.faceIsland[mi][fi];
+        const bool packed = P.faceSource[mi][fi] >= 0 && isl >= 0;
+        for (uint32_t k = 0; k < f.count; ++k) {
+            const uint32_t uvi = mesh.cornerUv[f.first + k];
+            const uint64_t key = ((uint64_t)uvi << 32) | (packed ? (uint32_t)isl : UINT32_MAX);
+            auto [it, fresh] = index.try_emplace(key, (int)out.verts.size());
+            if (fresh) {
+                UVVert v = part.uvw[uvi];
+                if (packed) {
+                    const Vec2d q = P.new_uv(P.islands[isl], mesh.uvs[uvi], P.faceTile[mi][fi]);
+                    v.x = (float)q.x;
+                    v.y = (float)q.y;
+                }
+                out.verts.push_back(v);
+            }
+            out.tv.push_back(it->second);
+        }
+    }
+    return out;
+}
+
+// Tiles in use, from the parts' source UVs and the maps.
+std::vector<UdimPackTile> pack_tiles(const PackState& st, const UdimPackSettings& s) {
+    std::map<int, int> faces;
+    for (const auto& [handle, part] : st.parts)
+        for (const InFace& f : part.mesh.faces)
+            if (const int udim = face_udim(part.mesh, f); udim > 0) ++faces[udim];
+    for (const UdimPackMap& m : s.maps) faces.try_emplace(m.tile, 0);
+    std::vector<UdimPackTile> tiles;
+    for (auto [tile, n] : faces) tiles.push_back({tile, n});
+    return tiles;
+}
+
+std::string last_line(const std::string& log) {
+    std::string s = log;
+    while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
+    const size_t nl = s.rfind('\n');
+    s = nl == std::string::npos ? s : s.substr(nl + 1);
+    return s.substr(s.find_first_not_of(' ') == std::string::npos ? 0 : s.find_first_not_of(' '));
+}
+
+void make_layout(PackState& st, const UdimPackSettings& s) {
+    st.ok = false;
+    st.packer.reset();
+    st.uvs.clear();
+    st.log.clear();
+    st.tiles = pack_tiles(st, s);
+    if (st.parts.empty()) {
+        st.report = "no mesh with UVs";
+        return;
+    }
+
+    auto P = std::make_unique<Packer>();
+    PackOptions& o = P->o;
+    o.sizeW = o.sizeH = s.size;
+    o.maxSize = s.maxSize;
+    o.padding = s.padding;
+    o.rotate = s.rotate;
+    o.obj = false;
+    InScene& scene = P->scene;
+    // Material 0 holds the faces of tiles without maps, left out; then one per tile with maps.
+    scene.materials.push_back({"<no maps>"});
+    o.excludes.push_back("<no maps>");
+    std::map<int, uint32_t> tileMaterial;
+    for (const UdimPackMap& m : s.maps) {
+        if (m.channel < 0 || m.channel >= kUdimPackChannels || s.channel[m.channel].empty() || m.file.empty()) continue;
+        auto [it, fresh] = tileMaterial.try_emplace(m.tile, (uint32_t)scene.materials.size());
+        if (fresh) scene.materials.push_back({std::to_string(m.tile)});
+        InTexture tex;
+        tex.channel = utf8(s.channel[m.channel].c_str());
+        tex.path = utf8(m.file.c_str());
+        tex.label = ustr(upath(tex.path).filename());
+        std::vector<InTexture>& textures = scene.materials[it->second].textures;
+        auto same = std::find_if(textures.begin(), textures.end(), [&](const InTexture& x) { return x.channel == tex.channel; });
+        if (same != textures.end()) *same = tex;
+        else textures.push_back(tex);
+    }
+    for (int c = 0; c < kUdimPackChannels; ++c)
+        if (!s.channel[c].empty()) o.kinds[utf8(s.channel[c].c_str())] = s.kind[c] == 1 ? "normal-gl" : s.kind[c] == 2 ? "normal-dx" : "color";
+    if (tileMaterial.empty()) {
+        st.report = "assign maps to the tiles to pack";
+        return;
+    }
+
+    std::vector<ULONG> order;
+    for (const auto& [handle, part] : st.parts) {
+        InMesh mesh = part.mesh;
+        if (INode* n = GetCOREInterface()->GetINodeByHandle(handle)) mesh.name = utf8(n->GetName());
+        for (InFace& f : mesh.faces) {
+            auto it = tileMaterial.find(face_udim(mesh, f));
+            f.material = it == tileMaterial.end() ? 0 : it->second;
+        }
+        scene.meshes.push_back(std::move(mesh));
+        order.push_back(handle);
+    }
+
+    SayCapture capture(st.log);
+    if (!P->bind()) {
+        st.report = last_line(st.log);
+        return;
+    }
+    P->build_islands();
+    if (!P->pack()) {
+        st.report = last_line(st.log);
+        return;
+    }
+    for (size_t mi = 0; mi < order.size(); ++mi) st.uvs[order[mi]] = packed_uvs(*P, mi, st.parts[order[mi]]);
+    char line[256];
+    std::snprintf(line, sizeof line, "%zu tile%s, %zu islands, %dx%d atlas, %zu map%s", tileMaterial.size(), tileMaterial.size() == 1 ? "" : "s",
+                  P->islands.size(), P->AW, P->AH, P->channels.size(), P->channels.size() == 1 ? "" : "s");
+    st.report = line;
+    // The first warning, if any: unreadable maps, maps of one tile at unrelated sizes, ...
+    if (const size_t w = st.log.find("  ! "); w != std::string::npos) st.report += "\n" + st.log.substr(w + 4, st.log.find('\n', w) - w - 4);
+    for (int c = 0; c < kUdimPackChannels; ++c) {
+        std::wstring low = s.channel[c];
+        for (wchar_t& ch : low) ch = (wchar_t)towlower(ch);
+        if (s.rotate && s.kind[c] == 0 && low.find(L"normal") != std::wstring::npos)
+            st.report += "\n'" + utf8(s.channel[c].c_str()) + "' looks like a normal map: set its type, or turned islands get wrong tangents";
+    }
+    st.packer = std::move(P);
+    st.ok = true;
+}
+
+// The packed UVs into the target channel of a node's mesh (the mesh the layout was made from).
+bool write_uvs(MNMesh& m, int channel, const PackUVs& uv) {
+    const CornerTable ct = corners_of(m);
+    if (ct.face.size() != uv.tv.size() || uv.verts.empty() || channel < 1) return false;
+    if (m.MNum() <= channel) m.SetMapNum(channel + 1);
+    MNMap* d = m.M(channel);
+    d->ClearAndFree();
+    d->ClearFlag(MN_DEAD);
+    d->setNumVerts((int)uv.verts.size());
+    for (size_t i = 0; i < uv.verts.size(); ++i) d->v[i] = uv.verts[i];
+    d->setNumFaces(m.FNum());
+    std::vector<int> live(m.FNum(), -1);
+    for (size_t i = 0; i < ct.faces.size(); ++i) live[ct.faces[i]] = (int)i;
+    for (int f = 0; f < m.FNum(); ++f) {
+        const int deg = m.F(f)->deg;
+        d->F(f)->SetSize(deg);
+        for (int k = 0; k < deg; ++k) d->F(f)->tv[k] = live[f] < 0 ? 0 : uv.tv[ct.first[live[f]] + k];
+    }
+    return true;
+}
+
+struct Busy {
+    Modifier* mod;
+    bool entered;
+    explicit Busy(Modifier* m) : mod(m), entered(packBusy.insert(m).second) {}
+    ~Busy() { if (entered) packBusy.erase(mod); }
+};
+
+bool pack_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, const UdimPackSettings& s, std::wstring& status,
+                 std::vector<UdimPackTile>& tiles) {
+    std::lock_guard guard(packLock);
+    Busy busy(self);
+    if (!busy.entered) return false;  // evaluating another part came back here: leave this one as it is
+    if (!node) node = node_of(self, &mc);
+    PackState& st = packs[self];
+    const std::vector<PackUse> uses = uses_of(self);
+    std::string err;
+
+    // This node's part from its input; the other parts evaluated below the modifier when unknown.
+    if (node) {
+        PackPart part;
+        if (make_part(mesh, s.sourceChannel, part, err)) st.parts[node->GetHandle()] = std::move(part);
+        else st.parts.erase(node->GetHandle());
+    }
+    const TimeValue t = GetCOREInterface()->GetTime();
+    for (const PackUse& u : uses) {
+        if (u.node == node) continue;
+        auto it = st.parts.find(u.node->GetHandle());
+        if (it != st.parts.end() && it->second.channel == s.sourceChannel) continue;
+        PackPart part;
+        std::string ignore;
+        if (read_part(u, t, s.sourceChannel, part, ignore)) st.parts[u.node->GetHandle()] = std::move(part);
+        else st.parts.erase(u.node->GetHandle());
+    }
+    for (auto it = st.parts.begin(); it != st.parts.end();) {
+        const bool used = std::any_of(uses.begin(), uses.end(), [&](const PackUse& u) { return u.node->GetHandle() == it->first; }) ||
+                          (node && node->GetHandle() == it->first);
+        it = used ? std::next(it) : st.parts.erase(it);
+    }
+
+    const uint64_t signature = layout_signature(st, s);
+    const bool changed = signature != st.layout;
+    if (changed) {
+        make_layout(st, s);
+        st.layout = signature;
+    }
+    tiles = st.tiles;
+
+    std::string report = st.report;
+    if (!node) {
+        report = "node not found";
+    } else if (!err.empty()) {
+        report = utf8(node->GetName()) + ": " + err;
+    } else if (st.ok) {
+        auto it = st.uvs.find(node->GetHandle());
+        if (it == st.uvs.end() || !write_uvs(mesh, s.targetChannel, it->second)) report += "\nthe layout does not fit this mesh";
+    }
+    report += "\n" + std::to_string(st.parts.size()) + " part" + (st.parts.size() == 1 ? "" : "s");
+    status = wide(report);
+    return changed && uses.size() > 1;
+}
+
+bool pack_bake(Modifier* self, const UdimPackSettings& s, UdimSink out, std::wstring& status, bool& relayout) {
+    std::lock_guard guard(packLock);
+    Busy busy(self);
+    relayout = false;
+    auto fail = [&](const std::string& why) {
+        status = wide(why);
+        out.write(out.ctx, why.data(), why.size());
+        return false;
+    };
+    if (!busy.entered) return fail("busy");
+    PackState& st = packs[self];
+
+    // Every part read again: a part the viewport has not evaluated since it changed would be stale.
+    const TimeValue t = GetCOREInterface()->GetTime();
+    st.parts.clear();
+    std::string log, err;
+    for (const PackUse& u : uses_of(self)) {
+        PackPart part;
+        if (read_part(u, t, s.sourceChannel, part, err)) st.parts[u.node->GetHandle()] = std::move(part);
+        else log += "  ! " + utf8(u.node->GetName()) + ": " + err + "\n";
+    }
+    const uint64_t signature = layout_signature(st, s);
+    if (signature != st.layout || !st.packer) {
+        make_layout(st, s);
+        st.layout = signature;
+        relayout = true;
+    }
+    log = st.log + log;
+    if (!st.ok) return fail(log + st.report);
+
+    std::filesystem::path dir = s.outDir;
+    const std::filesystem::path scene = GetCOREInterface()->GetCurFilePath().data();
+    if (dir.empty()) {
+        if (scene.empty()) return fail("save the scene or choose an output folder");
+        dir = scene.parent_path() / L"udimpacker";
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (!std::filesystem::is_directory(dir, ec)) return fail("cannot create " + ustr(dir));
+
+    Packer& P = *st.packer;
+    P.o.outDir = ustr(dir);
+    P.o.prefix = s.prefix.empty() ? "atlas" : utf8(s.prefix.c_str());
+    P.scene.sourcePath = ustr(scene);
+    P.verifySamples = P.verifyMismatches = 0;
+    bool ok;
+    {
+        SayCapture capture(log);
+        say("baking %dx%d into %s\n", P.AW, P.AH, P.o.outDir.c_str());
+        std::vector<uint8_t> owned;
+        BleedPlan plan;
+        std::vector<std::string> files;
+        ok = P.compose(owned, plan, files);
+        if (ok) {
+            P.write_layout(owned);
+            P.write_manifest(files);
+        }
+    }
+    out.write(out.ctx, log.data(), log.size());
+    if (!ok) return fail(last_line(log));
+    char line[512];
+    std::snprintf(line, sizeof line, "baked %zu map%s %dx%d, %zu of %zu samples differ\n%s", P.channels.size(), P.channels.size() == 1 ? "" : "s",
+                  P.AW, P.AH, P.verifyMismatches, P.verifySamples, P.o.outDir.c_str());
+    status = wide(line);
+    return P.verifyMismatches == 0;
+}
+
+void pack_forget(Modifier* self) {
+    std::lock_guard guard(packLock);
+    packs.erase(self);
+}
+
+const UdimCoreApi kApi{kUdimCoreApiVersion, kBuild, inspect, unsubdivide_modify, decimate_modify, write_weights,
+                       pack_modify, pack_bake, pack_forget};
 
 }  // namespace
 

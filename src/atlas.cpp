@@ -719,6 +719,8 @@ bool Packer::compose(std::vector<uint8_t>& owned, BleedPlan& plan, std::vector<s
             }
         }
         srcImg.clear();
+        verifySamples += samples;
+        verifyMismatches += mismatches;
 
         t0 = Clock::now();
         apply_bleed(atlas, plan, ch.kind != KIND_COLOR);

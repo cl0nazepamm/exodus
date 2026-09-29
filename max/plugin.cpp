@@ -100,14 +100,18 @@ MSTR json_error(const MSTR& what) { return MSTR(_M("{\"error\": \"")) + what + _
 class UdimInterface : public FPStaticInterface {
 public:
     DECLARE_DESCRIPTOR(UdimInterface)
-    enum { kVersion, kReload, kInspect, kSync };
+    enum { kVersion, kReload, kInspect, kSync, kBake };
 
     BEGIN_FUNCTION_MAP
     FN_0(kVersion, TYPE_TSTR_BV, Version)
     FN_0(kReload, TYPE_TSTR_BV, Reload)
     FN_1(kInspect, TYPE_TSTR_BV, Inspect, TYPE_INODE)
     VFN_0(kSync, Sync)
+    FN_1(kBake, TYPE_TSTR_BV, Bake, TYPE_REFTARG)
     END_FUNCTION_MAP
+
+    // Bake of a UDIM Pack modifier, as its button does; returns the report.
+    MSTR Bake(ReferenceTarget* modifier) { return pack_bake(modifier); }
 
     // Runs the work the modifiers left for after the evaluation (Skin weight updates) right now,
     // for scripts that change a modifier and read Skin in the same go.
@@ -126,6 +130,7 @@ public:
         }
         MSTR v = Version();
         reduce_refresh_all();
+        pack_refresh_all();
         return v;
     }
 
@@ -144,6 +149,8 @@ UdimInterface theInterface(kInterfaceId, _M("udimpacker"), 0, nullptr, FP_CORE,
     UdimInterface::kInspect, _M("inspect"), 0, TYPE_TSTR_BV, FP_NO_REDRAW, 1,
         _M("node"), 0, TYPE_INODE,
     UdimInterface::kSync, _M("sync"), 0, TYPE_VOID, 0, 0,
+    UdimInterface::kBake, _M("bake"), 0, TYPE_TSTR_BV, 0, 1,
+        _M("modifier"), 0, TYPE_REFTARG,
     p_end);
 // clang-format on
 
@@ -185,6 +192,11 @@ const MCHAR* udim_string(int id) {  // one stored string per id: Max may keep th
 
 const UdimCoreApi* udim_core() { return core.get(); }
 
+const UdimCoreApi* udim_core_loaded() {
+    std::lock_guard guard(core.lock);
+    return core.api;
+}
+
 MSTR udim_core_error() { return MSTR(_M("udimpacker core: ")) + core.error; }
 
 BOOL WINAPI DllMain(HINSTANCE instance, ULONG reason, LPVOID) {
@@ -196,12 +208,13 @@ BOOL WINAPI DllMain(HINSTANCE instance, ULONG reason, LPVOID) {
 }
 
 __declspec(dllexport) const MCHAR* LibDescription() { return _M("udimpacker: unsubdivide, decimate and UDIM packing"); }
-__declspec(dllexport) int LibNumberClasses() { return 3; }
+__declspec(dllexport) int LibNumberClasses() { return 4; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
     case 0: return &gupDesc;
     case 1: return unsubdivide_desc();
     case 2: return decimate_desc();
+    case 3: return pack_desc();
     default: return nullptr;
     }
 }

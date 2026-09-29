@@ -108,6 +108,7 @@ struct Packer {
     DecimateResult dec;
     bool unsubdivided = false;
     SubdivReport sub;
+    size_t verifySamples = 0, verifyMismatches = 0;  // totals of compose's verify pass
 
     double scale_for(const std::string& material) const;
 

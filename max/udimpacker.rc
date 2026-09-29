@@ -26,6 +26,69 @@ BEGIN
     LTEXT           "", IDC_STATUS, 6, 38, 96, 28
 END
 
+IDD_UDIMPACK DIALOGEX 0, 0, 108, 436
+STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
+FONT 8, "MS Sans Serif", 0, 0, 0x0
+BEGIN
+    LTEXT           "Source UV channel:", -1, 4, 6, 64, 8
+    CONTROL         "", IDC_SOURCE_EDIT, "CustEdit", WS_TABSTOP, 70, 4, 24, 10
+    CONTROL         "", IDC_SOURCE_SPIN, "SpinnerControl", 0x0, 95, 4, 7, 10
+    LTEXT           "Target UV channel:", -1, 4, 19, 64, 8
+    CONTROL         "", IDC_TARGET_EDIT, "CustEdit", WS_TABSTOP, 70, 17, 24, 10
+    CONTROL         "", IDC_TARGET_SPIN, "SpinnerControl", 0x0, 95, 17, 7, 10
+    LTEXT           "Size (0 = fit):", -1, 4, 32, 58, 8
+    CONTROL         "", IDC_SIZE_EDIT, "CustEdit", WS_TABSTOP, 64, 30, 30, 10
+    CONTROL         "", IDC_SIZE_SPIN, "SpinnerControl", 0x0, 95, 30, 7, 10
+    LTEXT           "Max size:", -1, 4, 45, 58, 8
+    CONTROL         "", IDC_MAXSIZE_EDIT, "CustEdit", WS_TABSTOP, 64, 43, 30, 10
+    CONTROL         "", IDC_MAXSIZE_SPIN, "SpinnerControl", 0x0, 95, 43, 7, 10
+    LTEXT           "Padding:", -1, 4, 58, 58, 8
+    CONTROL         "", IDC_PADDING_EDIT, "CustEdit", WS_TABSTOP, 70, 56, 24, 10
+    CONTROL         "", IDC_PADDING_SPIN, "SpinnerControl", 0x0, 95, 56, 7, 10
+    CONTROL         "Rotate islands", IDC_ROTATE, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 4, 70, 90, 10
+    LTEXT           "Channels: name, type", -1, 4, 86, 100, 8
+    CONTROL         "", IDC_CHANNEL1 + 0, "CustEdit", WS_TABSTOP, 4, 96, 52, 10
+    COMBOBOX        IDC_KIND1 + 0, 58, 95, 46, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    CONTROL         "", IDC_CHANNEL1 + 1, "CustEdit", WS_TABSTOP, 4, 109, 52, 10
+    COMBOBOX        IDC_KIND1 + 1, 58, 108, 46, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    CONTROL         "", IDC_CHANNEL1 + 2, "CustEdit", WS_TABSTOP, 4, 122, 52, 10
+    COMBOBOX        IDC_KIND1 + 2, 58, 121, 46, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    CONTROL         "", IDC_CHANNEL1 + 3, "CustEdit", WS_TABSTOP, 4, 135, 52, 10
+    COMBOBOX        IDC_KIND1 + 3, 58, 134, 46, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    CONTROL         "", IDC_CHANNEL1 + 4, "CustEdit", WS_TABSTOP, 4, 148, 52, 10
+    COMBOBOX        IDC_KIND1 + 4, 58, 147, 46, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    CONTROL         "", IDC_CHANNEL1 + 5, "CustEdit", WS_TABSTOP, 4, 161, 52, 10
+    COMBOBOX        IDC_KIND1 + 5, 58, 160, 46, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "UDIM tiles:", -1, 4, 177, 100, 8
+    LISTBOX         IDC_TILES, 4, 187, 100, 50, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER | WS_TABSTOP
+    LTEXT           "", IDC_TILE_LABEL, 4, 241, 100, 8
+    LTEXT           "", IDC_FILE_LABEL1 + 0, 4, 253, 32, 8
+    PUSHBUTTON      "", IDC_FILE1 + 0, 37, 251, 57, 11
+    PUSHBUTTON      "x", IDC_CLEAR1 + 0, 95, 251, 9, 11
+    LTEXT           "", IDC_FILE_LABEL1 + 1, 4, 266, 32, 8
+    PUSHBUTTON      "", IDC_FILE1 + 1, 37, 264, 57, 11
+    PUSHBUTTON      "x", IDC_CLEAR1 + 1, 95, 264, 9, 11
+    LTEXT           "", IDC_FILE_LABEL1 + 2, 4, 279, 32, 8
+    PUSHBUTTON      "", IDC_FILE1 + 2, 37, 277, 57, 11
+    PUSHBUTTON      "x", IDC_CLEAR1 + 2, 95, 277, 9, 11
+    LTEXT           "", IDC_FILE_LABEL1 + 3, 4, 292, 32, 8
+    PUSHBUTTON      "", IDC_FILE1 + 3, 37, 290, 57, 11
+    PUSHBUTTON      "x", IDC_CLEAR1 + 3, 95, 290, 9, 11
+    LTEXT           "", IDC_FILE_LABEL1 + 4, 4, 305, 32, 8
+    PUSHBUTTON      "", IDC_FILE1 + 4, 37, 303, 57, 11
+    PUSHBUTTON      "x", IDC_CLEAR1 + 4, 95, 303, 9, 11
+    LTEXT           "", IDC_FILE_LABEL1 + 5, 4, 318, 32, 8
+    PUSHBUTTON      "", IDC_FILE1 + 5, 37, 316, 57, 11
+    PUSHBUTTON      "x", IDC_CLEAR1 + 5, 95, 316, 9, 11
+    LTEXT           "Output folder (empty = next to the scene):", -1, 4, 333, 100, 8
+    CONTROL         "", IDC_OUT_DIR, "CustEdit", WS_TABSTOP, 4, 343, 86, 10
+    PUSHBUTTON      "...", IDC_OUT_DIR_BROWSE, 92, 342, 12, 11
+    LTEXT           "Prefix:", -1, 4, 358, 28, 8
+    CONTROL         "", IDC_PREFIX, "CustEdit", WS_TABSTOP, 34, 356, 70, 10
+    PUSHBUTTON      "Bake atlas", IDC_BAKE, 4, 370, 100, 14
+    LTEXT           "", IDC_STATUS, 4, 388, 100, 44
+END
+
 STRINGTABLE
 BEGIN
     IDS_CATEGORY "udimpacker"
@@ -36,4 +99,23 @@ BEGIN
     IDS_DECIMATE "Decimate"
     IDS_PERCENT "Keep %"
     IDS_LOCK_BORDER "Lock borders"
+    IDS_UDIMPACK "UDIM Pack"
+    IDS_SOURCE_CHANNEL "Source UV channel"
+    IDS_TARGET_CHANNEL "Target UV channel"
+    IDS_SIZE "Size"
+    IDS_MAX_SIZE "Max size"
+    IDS_PADDING "Padding"
+    IDS_ROTATE "Rotate islands"
+    IDS_OUT_DIR "Output folder"
+    IDS_PREFIX "Prefix"
+    IDS_CHANNEL "Channel"
+    IDS_KIND "Type"
+    IDS_KIND_COLOR "Color"
+    IDS_KIND_NORMAL_GL "Normal GL"
+    IDS_KIND_NORMAL_DX "Normal DX"
+    IDS_MAP_TILES "Map tiles"
+    IDS_MAP_CHANNELS "Map channels"
+    IDS_MAP_FILES "Map files"
+    IDS_ASSIGN_MAP "Assign map"
+    IDS_CHOOSE_OUT_DIR "Atlas output folder"
 END
