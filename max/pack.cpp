@@ -26,7 +26,7 @@ enum : ParamID {
     kSourceChannel = 0, kTargetChannel = 1, kSize = 2, kMaxSize = 3, kPadding = 4, kRotate = 5, kOutDir = 6, kPrefix = 7,
     kChannel1 = 10,  // .. 15: channel names
     kKind1 = 20,     // .. 25: channel types
-    kMapTiles = 30, kMapChannels = 31, kMapFiles = 32,  // one row per map: tile, channel, file
+    kMapTiles = 30, kMapChannels = 31, kMapFiles = 32,  // one row per map: tile, channel (1-based), file
 };
 
 class PackMod;
@@ -70,7 +70,7 @@ public:
             pblock->GetValue(kKind1 + c, t, s.kind[c], valid);
         }
         const int n = std::min({pblock->Count(kMapTiles), pblock->Count(kMapChannels), pblock->Count(kMapFiles)});
-        for (int i = 0; i < n; ++i) s.maps.push_back({pblock->GetInt(kMapTiles, t, i), pblock->GetInt(kMapChannels, t, i), str(kMapFiles, i)});
+        for (int i = 0; i < n; ++i) s.maps.push_back({pblock->GetInt(kMapTiles, t, i), pblock->GetInt(kMapChannels, t, i) - 1, str(kMapFiles, i)});
         s.outDir = str(kOutDir);
         s.prefix = str(kPrefix);
         return s;
@@ -79,7 +79,7 @@ public:
     int FindMap(int tile, int channel) {
         const int n = std::min({pblock->Count(kMapTiles), pblock->Count(kMapChannels), pblock->Count(kMapFiles)});
         for (int i = 0; i < n; ++i)
-            if (pblock->GetInt(kMapTiles, 0, i) == tile && pblock->GetInt(kMapChannels, 0, i) == channel) return i;
+            if (pblock->GetInt(kMapTiles, 0, i) == tile && pblock->GetInt(kMapChannels, 0, i) == channel + 1) return i;
         return -1;
     }
 
@@ -91,7 +91,7 @@ public:
             if (row >= 0) {
                 pblock->SetValue(kMapFiles, 0, file, row);
             } else {
-                int t = tile, c = channel;
+                int t = tile, c = channel + 1;  // 1-based, as channel1 .. channel6
                 const MCHAR* f = file;
                 pblock->Append(kMapTiles, 1, &t);
                 pblock->Append(kMapChannels, 1, &c);
@@ -129,7 +129,8 @@ public:
         return map && map->GetParamBlock() == pblock && map->GetHWnd() ? map : nullptr;
     }
 
-    void UpdateUI();
+    // Refreshes the rollout (`hw` while it opens: Max registers the map only afterwards).
+    void UpdateUI(HWND hw = nullptr);
 
     // Animatable
     void DeleteThis() override { delete this; }
@@ -211,10 +212,12 @@ void post_refresh(PackMod* mod) {
 
 std::wstring file_name(const std::wstring& path) { return std::filesystem::path(path).filename().wstring(); }
 
-void PackMod::UpdateUI() {
-    IParamMap2* map = Map();
-    if (!map) return;
-    HWND hw = map->GetHWnd();
+void PackMod::UpdateUI(HWND hw) {
+    if (!hw) {
+        IParamMap2* map = Map();
+        if (!map) return;
+        hw = map->GetHWnd();
+    }
     SetDlgItemText(hw, IDC_STATUS, status.data());
 
     // Tiles: the ones in the UVs and the ones with maps.
@@ -291,7 +294,7 @@ public:
         switch (msg) {
         case WM_INITDIALOG:
             mod->shownLines.clear();
-            mod->UpdateUI();
+            mod->UpdateUI(hw);
             return TRUE;
         case WM_COMMAND: {
             const int id = LOWORD(wp), code = HIWORD(wp);
@@ -299,7 +302,7 @@ public:
                 HWND box = GetDlgItem(hw, IDC_TILES);
                 const int item = (int)SendMessage(box, LB_GETCURSEL, 0, 0);
                 if (item >= 0) mod->selectedTile = (int)SendMessage(box, LB_GETITEMDATA, item, 0);
-                mod->UpdateUI();
+                mod->UpdateUI(hw);
                 return TRUE;
             }
             if (code != BN_CLICKED) return FALSE;

@@ -80,7 +80,7 @@ BEGIN
     LTEXT           "", IDC_FILE_LABEL1 + 5, 4, 318, 32, 8
     PUSHBUTTON      "", IDC_FILE1 + 5, 37, 316, 57, 11
     PUSHBUTTON      "x", IDC_CLEAR1 + 5, 95, 316, 9, 11
-    LTEXT           "Output folder (empty = next to the scene):", -1, 4, 333, 100, 8
+    LTEXT           "Output folder:", -1, 4, 333, 100, 8
     CONTROL         "", IDC_OUT_DIR, "CustEdit", WS_TABSTOP, 4, 343, 86, 10
     PUSHBUTTON      "...", IDC_OUT_DIR_BROWSE, 92, 342, 12, 11
     LTEXT           "Prefix:", -1, 4, 358, 28, 8

@@ -112,9 +112,14 @@ public:
         po->UpdateValidity(SELECT_CHAN_NUM, valid);
     }
 
-    void ShowStatus() {
-        IParamMap2* map = Desc().GetParamMap(&PbDesc());
-        if (map && map->GetParamBlock() == pblock && map->GetHWnd()) SetDlgItemText(map->GetHWnd(), IDC_STATUS, status.data());
+    // `hw` while the rollout opens: Max registers the map only afterwards.
+    void ShowStatus(HWND hw = nullptr) {
+        if (!hw) {
+            IParamMap2* map = Desc().GetParamMap(&PbDesc());
+            if (!map || map->GetParamBlock() != pblock) return;
+            hw = map->GetHWnd();
+        }
+        if (hw) SetDlgItemText(hw, IDC_STATUS, status.data());
     }
 
     IOResult SaveLocalData(ISave* isave, LocalModData* ld) override;
@@ -124,9 +129,9 @@ public:
 // Shows a modifier's status line when its rollout opens.
 class StatusDlgProc : public ParamMap2UserDlgProc {
 public:
-    INT_PTR DlgProc(TimeValue, IParamMap2* map, HWND, UINT msg, WPARAM, LPARAM) override {
+    INT_PTR DlgProc(TimeValue, IParamMap2* map, HWND hw, UINT msg, WPARAM, LPARAM) override {
         if (msg == WM_INITDIALOG)
-            if (auto* mod = static_cast<ReduceMod*>(map->GetParamBlock()->GetOwner())) mod->ShowStatus();
+            if (auto* mod = static_cast<ReduceMod*>(map->GetParamBlock()->GetOwner())) mod->ShowStatus(hw);
         return FALSE;
     }
     void DeleteThis() override {}
