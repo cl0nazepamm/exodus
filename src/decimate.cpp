@@ -24,16 +24,17 @@ struct Q3Hash {
     }
 };
 
-// One simplifier vertex. Corners share a vertex only when mesh, position, normal, UV and material
-// all match; anything else is a separate vertex at the same position, i.e. a seam.
+// One simplifier vertex. Corners share a vertex only when mesh, position, normal, UV, material and
+// seam key all match; anything else is a separate vertex at the same position, i.e. a seam.
 struct VKey {
-    uint32_t mesh, pos, nrm, uv, material;
+    uint32_t mesh, pos, nrm, uv, material, seam;
     bool operator==(const VKey&) const = default;
 };
 
 struct VKeyHash {
     size_t operator()(const VKey& k) const {
-        return Q3Hash{}({(int64_t)((uint64_t)k.mesh << 32 | k.material), k.pos, (int64_t)((uint64_t)k.nrm << 32 | k.uv)});
+        return Q3Hash{}({(int64_t)((uint64_t)k.mesh << 32 | k.material), (int64_t)((uint64_t)k.seam << 32 | k.pos),
+                         (int64_t)((uint64_t)k.nrm << 32 | k.uv)});
     }
 };
 
@@ -104,6 +105,7 @@ DecimateResult decimate_scene(InScene& scene, const std::vector<uint8_t>& drop, 
 
     // ---- one indexed triangle list for the whole scene -------------------------------------
     std::vector<VKey> verts;
+    std::vector<uint32_t> vertCorner;  // per simplifier vertex: the first corner with its key
     std::unordered_map<VKey, uint32_t, VKeyHash> lookup;
     std::vector<float> pos, attr;
     std::vector<uint32_t> indices;
@@ -120,10 +122,11 @@ DecimateResult decimate_scene(InScene& scene, const std::vector<uint8_t>& drop, 
             for (int k = 0; k < 3; ++k) {
                 const uint32_t c = m.tris[ti][k];
                 const VKey key{mi, m.cornerPos[c], m.cornerNrm.empty() ? kNone : nrmId[m.cornerNrm[c]], uvId[m.cornerUv[c]],
-                               material};
+                               material, m.cornerSeam.empty() ? 0 : m.cornerSeam[c]};
                 auto [it, fresh] = lookup.try_emplace(key, (uint32_t)verts.size());
                 if (fresh) {
                     verts.push_back(key);
+                    vertCorner.push_back(c);
                     const Vec3d& p = m.positions[key.pos];
                     pos.insert(pos.end(), {(float)p[0], (float)p[1], (float)p[2]});
                     Vec3d n = {0, 0, 0};
@@ -203,6 +206,7 @@ DecimateResult decimate_scene(InScene& scene, const std::vector<uint8_t>& drop, 
             dst.cornerPos.push_back(remap(posMap[mi], v[k]->pos, dst.positions, src.positions));
             if (!src.cornerNrm.empty()) dst.cornerNrm.push_back(remap(nrmMap[mi], v[k]->nrm, dst.normals, src.normals));
             dst.cornerUv.push_back(remap(uvMap[mi], v[k]->uv, dst.uvs, src.uvs));
+            if (!src.cornerSrc.empty()) dst.cornerSrc.push_back(src.cornerSrc[vertCorner[out[t + k]]]);
         }
         dst.tris.push_back({first, first + 1, first + 2});
         ++res.meshes[mi].after;

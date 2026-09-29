@@ -43,7 +43,8 @@ struct InMesh {
     std::vector<Vec3d> normals;    // world space, indexed by cornerNrm (may be empty)
     std::vector<Vec2d> uvs;        // indexed by cornerUv
     std::vector<uint32_t> cornerPos, cornerNrm, cornerUv;
-    std::vector<uint32_t> cornerSrc;  // optional: the input corner each corner comes from (kept by unsubdivide)
+    std::vector<uint32_t> cornerSrc;   // optional: the input corner each corner comes from (kept by unsubdivide and decimate)
+    std::vector<uint32_t> cornerSeam;  // optional: corners with different values never merge in decimation (extra seams)
     std::vector<InFace> faces;
     std::vector<std::array<uint32_t, 3>> tris;  // corner indices
     std::vector<uint32_t> triFace;              // owning face per triangle
