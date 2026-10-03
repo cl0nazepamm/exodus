@@ -1,10 +1,13 @@
 // Exodus for 3ds Max: the UDIM Pack modifier. One instance goes on every part of a character
-// (select them all, add the modifier once). The maps are given by hand per UDIM tile: pick a tile
-// in the list, pick a file for each channel. Tiles with maps are packed into one atlas, the packed
+// (select them all, add the modifier once). The maps are given by hand per UDIM tile, for all
+// objects or for one object: pick an object (or all), a tile in the list, a file for each channel.
+// An object's own maps in a tile replace the ones for all objects there, so objects that each use
+// tile 1001 with their own textures pack side by side. Tiles with maps go into one atlas, the packed
 // UVs go into the target map channel and Bake writes the atlas maps. The layout lives in the core
 // DLL (see maxcore.cpp); this part holds the parameters and the rollout.
 #include <iparamm2.h>
 #include <modstack.h>
+#include <notify.h>
 #include <polyobj.h>
 #include <Util/MainThreadTaskManager.h>
 #include <commdlg.h>  // after windows.h (from the Max headers)
@@ -26,20 +29,42 @@ enum : ParamID {
     kSourceChannel = 0, kTargetChannel = 1, kSize = 2, kMaxSize = 3, kPadding = 4, kRotate = 5, kOutDir = 6, kPrefix = 7,
     kChannel1 = 10,  // .. 15: channel names
     kKind1 = 20,     // .. 25: channel types
-    kMapTiles = 30, kMapChannels = 31, kMapFiles = 32,  // one row per map: tile, channel (1-based), file
+    // One row per map: tile, channel (1-based), file and object (node name, empty = all objects;
+    // missing rows at the end, as scripts written for the first three leave them, are empty).
+    kMapTiles = 30, kMapChannels = 31, kMapFiles = 32, kMapObjects = 33,
+    kCollapsed = 34,  // names of the objects whose stack was collapsed with the modifier: they keep their place
 };
 
 class PackMod;
 std::set<PackMod*> packInstances;
 void post_refresh(PackMod* mod);
 
+// The names of the objects the modifier is on, sorted (deleted ones, kept for undo, left out).
+std::vector<std::wstring> object_names(ReferenceTarget* mod) {
+    struct Nodes : DependentEnumProc {
+        std::vector<std::wstring> names;
+        int proc(ReferenceMaker* rm) override {
+            if (rm->SuperClassID() != BASENODE_CLASS_ID) return DEP_ENUM_CONTINUE;
+            auto* n = static_cast<INode*>(rm);
+            if (n->GetParentNode()) names.push_back(n->GetName() ? n->GetName() : L"");
+            return DEP_ENUM_SKIP;
+        }
+    } nodes;
+    mod->DoEnumDependents(&nodes);
+    std::sort(nodes.names.begin(), nodes.names.end());
+    nodes.names.erase(std::unique(nodes.names.begin(), nodes.names.end()), nodes.names.end());
+    return nodes.names;
+}
+
 class PackMod : public Modifier {
 public:
     IParamBlock2* pblock = nullptr;
     MSTR status;
     std::vector<ExodusPackTile> tiles;  // from the last evaluation
+    std::wstring selectedObject;      // object shown in the rollout's tile list; empty = all objects
     int selectedTile = 0;             // tile shown in the rollout's map rows
-    std::vector<std::wstring> shownLines;  // the tile list as shown
+    std::vector<std::wstring> shownObjects, shownLines;  // the object and tile lists as shown
+    std::vector<std::wstring> objectList;  // per object list item: the name (item 0, all objects: empty)
     bool refreshPending = false;
 
     PackMod();
@@ -69,40 +94,102 @@ public:
             s.channel[c] = str(kChannel1 + c);
             pblock->GetValue(kKind1 + c, t, s.kind[c], valid);
         }
-        const int n = std::min({pblock->Count(kMapTiles), pblock->Count(kMapChannels), pblock->Count(kMapFiles)});
-        for (int i = 0; i < n; ++i) s.maps.push_back({pblock->GetInt(kMapTiles, t, i), pblock->GetInt(kMapChannels, t, i) - 1, str(kMapFiles, i)});
+        for (int i = 0; i < Rows(); ++i)
+            s.maps.push_back({MapObject(i), pblock->GetInt(kMapTiles, t, i), pblock->GetInt(kMapChannels, t, i) - 1, str(kMapFiles, i)});
+        for (int i = 0; i < pblock->Count(kCollapsed); ++i)
+            if (const std::wstring name = Collapsed(i); !name.empty()) s.collapsed.push_back(name);
         s.outDir = str(kOutDir);
         s.prefix = str(kPrefix);
         return s;
     }
 
-    int FindMap(int tile, int channel) {
-        const int n = std::min({pblock->Count(kMapTiles), pblock->Count(kMapChannels), pblock->Count(kMapFiles)});
-        for (int i = 0; i < n; ++i)
-            if (pblock->GetInt(kMapTiles, 0, i) == tile && pblock->GetInt(kMapChannels, 0, i) == channel + 1) return i;
+    int Rows() { return std::min({pblock->Count(kMapTiles), pblock->Count(kMapChannels), pblock->Count(kMapFiles)}); }
+
+    std::wstring MapObject(int row) {
+        const MCHAR* v = row < pblock->Count(kMapObjects) ? pblock->GetStr(kMapObjects, 0, row) : nullptr;
+        return v ? v : L"";
+    }
+
+    std::wstring Collapsed(int i) {
+        const MCHAR* v = pblock->GetStr(kCollapsed, 0, i);
+        return v ? v : L"";
+    }
+
+    std::wstring MapFile(int row) {
+        const MCHAR* v = row >= 0 ? pblock->GetStr(kMapFiles, 0, row) : nullptr;
+        return v ? v : L"";
+    }
+
+    int FindMap(const std::wstring& object, int tile, int channel) {
+        for (int i = 0; i < Rows(); ++i)
+            if (pblock->GetInt(kMapTiles, 0, i) == tile && pblock->GetInt(kMapChannels, 0, i) == channel + 1 && MapObject(i) == object) return i;
         return -1;
     }
 
-    // Sets (or with an empty file, removes) the map of one channel in one tile, as one undo step.
-    void SetMap(int tile, int channel, const MCHAR* file) {
-        const int row = FindMap(tile, channel);
+    // The maps of an object (empty: all objects) in a tile that are packed: named channel, file set.
+    int CountMaps(const std::wstring& object, int tile) {
+        int n = 0;
+        for (int c = 0; c < kExodusPackChannels; ++c) {
+            const MCHAR* name = pblock->GetStr(kChannel1 + c, 0);
+            n += name && *name && !MapFile(FindMap(object, tile, c)).empty();
+        }
+        return n;
+    }
+
+    void AppendMap(const std::wstring& object, int tile, int channel, const std::wstring& file) {
+        int t = tile, c = channel + 1;  // 1-based, as channel1 .. channel6
+        const MCHAR* f = file.c_str();
+        const MCHAR* o = object.c_str();
+        pblock->Append(kMapTiles, 1, &t);
+        pblock->Append(kMapChannels, 1, &c);
+        pblock->Append(kMapFiles, 1, &f);
+        pblock->Append(kMapObjects, 1, &o);
+    }
+
+    // Sets (or with an empty file, removes) the map of one channel in one tile for an object (empty:
+    // all objects), as one undo step. An object's first own map in a tile starts from the maps for
+    // all objects there, which its own replace.
+    void SetMap(const std::wstring& object, int tile, int channel, const MCHAR* file) {
         theHold.Begin();
+        // The rows as one table: the object column as long as the others.
+        const int rows = Rows();
+        for (ParamID id : {kMapTiles, kMapChannels, kMapFiles})
+            if (pblock->Count(id) > rows) pblock->Delete(id, rows, pblock->Count(id) - rows);
+        if (pblock->Count(kMapObjects) > rows) pblock->Delete(kMapObjects, rows, pblock->Count(kMapObjects) - rows);
+        for (const MCHAR* none = L""; pblock->Count(kMapObjects) < rows;) pblock->Append(kMapObjects, 1, &none);
+
+        const int row = FindMap(object, tile, channel);
         if (file && *file) {
-            if (row >= 0) {
-                pblock->SetValue(kMapFiles, 0, file, row);
-            } else {
-                int t = tile, c = channel + 1;  // 1-based, as channel1 .. channel6
-                const MCHAR* f = file;
-                pblock->Append(kMapTiles, 1, &t);
-                pblock->Append(kMapChannels, 1, &c);
-                pblock->Append(kMapFiles, 1, &f);
-            }
+            if (!object.empty() && CountMaps(object, tile) == 0)
+                for (int c = 0; c < kExodusPackChannels; ++c)
+                    if (const std::wstring shared = MapFile(FindMap(L"", tile, c)); c != channel && !shared.empty() && FindMap(object, tile, c) < 0)
+                        AppendMap(object, tile, c, shared);
+            if (row >= 0) pblock->SetValue(kMapFiles, 0, file, row);
+            else AppendMap(object, tile, channel, file);
         } else if (row >= 0) {
-            pblock->Delete(kMapFiles, row, 1);
-            pblock->Delete(kMapChannels, row, 1);
-            pblock->Delete(kMapTiles, row, 1);
+            for (ParamID id : {kMapObjects, kMapFiles, kMapChannels, kMapTiles}) pblock->Delete(id, row, 1);
         }
         theHold.Accept(exodus_string(IDS_ASSIGN_MAP));
+    }
+
+    // A node was renamed. If it is one of this modifier's objects (or a collapsed one), its maps
+    // follow the new name (unless another object still has the old one) and the tile list is made again.
+    void RenameObject(const std::wstring& from, const std::wstring& to) {
+        bool ours = false;
+        if (!GetCOREInterface()->GetINodeByName(from.c_str()))
+            for (int i = 0; i < pblock->Count(kCollapsed); ++i)
+                if (Collapsed(i) == from) {
+                    pblock->SetValue(kCollapsed, 0, to.c_str(), i);
+                    ours = true;
+                }
+        const std::vector<std::wstring> names = object_names(this);
+        if (!ours && !std::binary_search(names.begin(), names.end(), to)) return;
+        if (!std::binary_search(names.begin(), names.end(), from)) {
+            for (int i = 0; i < pblock->Count(kMapObjects); ++i)
+                if (MapObject(i) == from) pblock->SetValue(kMapObjects, 0, to.c_str(), i);
+            if (selectedObject == from) selectedObject = to;
+        }
+        NotifyDependents(FOREVER, PART_TEXMAP, REFMSG_CHANGE);
     }
 
     // Bake: the atlas maps into the output folder. Returns the packer's report.
@@ -187,6 +274,17 @@ public:
         UpdateUI();
         po->UpdateValidity(TEXMAP_CHAN_NUM, valid);
     }
+
+    // The node's stack is collapsed with this modifier in it: its packed UVs become part of its
+    // mesh, so it keeps its place in the layout and the other objects do not move.
+    void NotifyPreCollapse(INode* node, IDerivedObject*, int) override {
+        const std::wstring name = node && node->GetName() ? node->GetName() : L"";
+        if (name.empty()) return;
+        for (int i = 0; i < pblock->Count(kCollapsed); ++i)
+            if (Collapsed(i) == name) return;
+        const MCHAR* n = name.c_str();
+        pblock->Append(kCollapsed, 1, &n);
+    }
 };
 
 // After an evaluation changed the layout: the other parts evaluate again.
@@ -220,23 +318,78 @@ void PackMod::UpdateUI(HWND hw) {
     }
     SetDlgItemText(hw, IDC_STATUS, status.data());
 
-    // Tiles: the ones in the UVs and the ones with maps.
+    // Objects: the ones the modifier is on, the collapsed ones, then the ones with maps that are
+    // neither (removed, or renamed by a script).
+    const std::vector<std::wstring> present = object_names(this);
+    std::vector<std::wstring> collapsed, missing;
+    for (int i = 0; i < pblock->Count(kCollapsed); ++i)
+        if (const std::wstring o = Collapsed(i);
+            !o.empty() && !std::binary_search(present.begin(), present.end(), o) && GetCOREInterface()->GetINodeByName(o.c_str()))
+            collapsed.push_back(o);
+    std::sort(collapsed.begin(), collapsed.end());
+    collapsed.erase(std::unique(collapsed.begin(), collapsed.end()), collapsed.end());
+    for (int i = 0; i < Rows(); ++i)
+        if (const std::wstring o = MapObject(i); !o.empty() && !std::binary_search(present.begin(), present.end(), o) &&
+                                                 !std::binary_search(collapsed.begin(), collapsed.end(), o))
+            missing.push_back(o);
+    std::sort(missing.begin(), missing.end());
+    missing.erase(std::unique(missing.begin(), missing.end()), missing.end());
+    std::vector<std::wstring> items{L"All objects"};
+    objectList = {L""};
+    for (const std::wstring& o : present) {
+        items.push_back(o);
+        objectList.push_back(o);
+    }
+    for (const std::wstring& o : collapsed) {
+        items.push_back(o + L" (collapsed)");
+        objectList.push_back(o);
+    }
+    for (const std::wstring& o : missing) {
+        items.push_back(o + L" (not found)");
+        objectList.push_back(o);
+    }
+    auto selected = std::find(objectList.begin(), objectList.end(), selectedObject);
+    if (selected == objectList.end()) selectedObject.clear(), selected = objectList.begin();
+    HWND objects = GetDlgItem(hw, IDC_OBJECT);
+    if (items != shownObjects) {
+        SendMessage(objects, CB_RESETCONTENT, 0, 0);
+        for (const std::wstring& item : items) SendMessage(objects, CB_ADDSTRING, 0, (LPARAM)item.c_str());
+        shownObjects = items;
+    }
+    const int objectItem = (int)(selected - objectList.begin());
+    if ((int)SendMessage(objects, CB_GETCURSEL, 0, 0) != objectItem) SendMessage(objects, CB_SETCURSEL, objectItem, 0);
+
+    // Tiles of the selected object (all objects: of any): the ones in the UVs and the ones with maps.
+    const std::wstring& object = selectedObject;
     std::vector<int> list;
-    for (const ExodusPackTile& t : tiles) list.push_back(t.tile);
-    for (int i = 0; i < pblock->Count(kMapTiles); ++i) list.push_back(pblock->GetInt(kMapTiles, 0, i));
+    for (const ExodusPackTile& t : tiles)
+        if (object.empty() || t.object == object) list.push_back(t.tile);
+    for (int i = 0; i < Rows(); ++i)
+        if (object.empty() || MapObject(i) == object) list.push_back(pblock->GetInt(kMapTiles, 0, i));
     std::sort(list.begin(), list.end());
     list.erase(std::unique(list.begin(), list.end()), list.end());
     if (!list.empty() && std::find(list.begin(), list.end(), selectedTile) == list.end()) selectedTile = list.front();
 
+    auto n_maps = [](int n) { return std::to_wstring(n) + (n == 1 ? L" map" : L" maps"); };
     std::vector<std::wstring> lines;
     for (int tile : list) {
-        int faces = 0, maps = 0;
+        int faces = 0, users = 0;
         for (const ExodusPackTile& t : tiles)
-            if (t.tile == tile) faces = t.faces;
-        for (int c = 0; c < kExodusPackChannels; ++c) maps += FindMap(tile, c) >= 0;
-        wchar_t line[128];
-        swprintf_s(line, L"%d   %d faces   %s", tile, faces,
-                   maps ? (std::to_wstring(maps) + (maps == 1 ? L" map" : L" maps")).c_str() : L"not packed");
+            if (t.tile == tile && (object.empty() || t.object == object)) faces += t.faces, ++users;
+        const int shared = CountMaps(L"", tile);
+        std::wstring maps;
+        if (object.empty()) {
+            bool own = false;
+            for (int i = 0; i < Rows() && !own; ++i) own = pblock->GetInt(kMapTiles, 0, i) == tile && !MapObject(i).empty();
+            maps = shared ? n_maps(shared) : own ? L"per object" : L"not packed";
+        } else {
+            const int own = CountMaps(object, tile);
+            maps = own ? n_maps(own) : shared ? n_maps(shared) + L" (all)" : L"not packed";
+        }
+        // Several objects in one tile: their count (they share the tile's maps unless they have their own).
+        wchar_t line[256];
+        swprintf_s(line, L"%d   %s   %s", tile, (users > 1 ? std::to_wstring(users) + L" objects" : std::to_wstring(faces) + L" faces").c_str(),
+                   maps.c_str());
         lines.push_back(line);
     }
     HWND box = GetDlgItem(hw, IDC_TILES);
@@ -256,15 +409,19 @@ void PackMod::UpdateUI(HWND hw) {
     for (size_t i = 0; i < list.size(); ++i)
         if (list[i] == selectedTile && (int)SendMessage(box, LB_GETCURSEL, 0, 0) != (int)i) SendMessage(box, LB_SETCURSEL, i, 0);
 
-    // The selected tile's map per channel.
-    SetDlgItemText(hw, IDC_TILE_LABEL, list.empty() ? L"" : (L"Maps of tile " + std::to_wstring(selectedTile) + L":").c_str());
+    // The selected tile's map per channel: the object's own, or while it has none there the ones
+    // for all objects ("all: ").
+    SetDlgItemText(hw, IDC_TILE_LABEL,
+                   list.empty() ? L"" : ((object.empty() ? L"All objects" : object) + L", tile " + std::to_wstring(selectedTile) + L":").c_str());
+    const bool inherits = !object.empty() && CountMaps(object, selectedTile) == 0;
     for (int c = 0; c < kExodusPackChannels; ++c) {
         const MCHAR* name = pblock->GetStr(kChannel1 + c, 0);
         const bool used = name && *name && !list.empty();
-        const int row = FindMap(selectedTile, c);
-        const MCHAR* file = row >= 0 ? pblock->GetStr(kMapFiles, 0, row) : nullptr;
+        const int row = FindMap(object, selectedTile, c);
+        const std::wstring file = MapFile(row), shared = inherits ? MapFile(FindMap(L"", selectedTile, c)) : L"";
         SetDlgItemText(hw, IDC_FILE_LABEL1 + c, name ? name : L"");
-        SetDlgItemText(hw, IDC_FILE1 + c, !used ? L"" : file && *file ? file_name(file).c_str() : L"(none)");
+        SetDlgItemText(hw, IDC_FILE1 + c,
+                       (!used ? L"" : !file.empty() ? file_name(file) : !shared.empty() ? L"all: " + file_name(shared) : L"(none)").c_str());
         EnableWindow(GetDlgItem(hw, IDC_FILE1 + c), used);
         EnableWindow(GetDlgItem(hw, IDC_CLEAR1 + c), used && row >= 0);
     }
@@ -293,11 +450,18 @@ public:
         if (!mod) return FALSE;
         switch (msg) {
         case WM_INITDIALOG:
+            mod->shownObjects.clear();
             mod->shownLines.clear();
             mod->UpdateUI(hw);
             return TRUE;
         case WM_COMMAND: {
             const int id = LOWORD(wp), code = HIWORD(wp);
+            if (id == IDC_OBJECT && code == CBN_SELCHANGE) {
+                const int item = (int)SendMessage(GetDlgItem(hw, IDC_OBJECT), CB_GETCURSEL, 0, 0);
+                if (item >= 0 && item < (int)mod->objectList.size()) mod->selectedObject = mod->objectList[item];
+                mod->UpdateUI(hw);
+                return TRUE;
+            }
             if (id == IDC_TILES && code == LBN_SELCHANGE) {
                 HWND box = GetDlgItem(hw, IDC_TILES);
                 const int item = (int)SendMessage(box, LB_GETCURSEL, 0, 0);
@@ -307,14 +471,15 @@ public:
             }
             if (code != BN_CLICKED) return FALSE;
             if (id >= IDC_FILE1 && id < IDC_FILE1 + kExodusPackChannels) {
-                const int c = id - IDC_FILE1, row = mod->FindMap(mod->selectedTile, c);
-                const MCHAR* current = row >= 0 ? mod->pblock->GetStr(kMapFiles, 0, row) : nullptr;
-                const std::wstring file = pick_image(GetCOREInterface()->GetMAXHWnd(), current ? current : L"");
-                if (!file.empty()) mod->SetMap(mod->selectedTile, c, file.c_str());
+                const int c = id - IDC_FILE1;
+                std::wstring current = mod->MapFile(mod->FindMap(mod->selectedObject, mod->selectedTile, c));
+                if (current.empty()) current = mod->MapFile(mod->FindMap(L"", mod->selectedTile, c));  // start where the shared one is
+                const std::wstring file = pick_image(GetCOREInterface()->GetMAXHWnd(), current);
+                if (!file.empty()) mod->SetMap(mod->selectedObject, mod->selectedTile, c, file.c_str());
                 return TRUE;
             }
             if (id >= IDC_CLEAR1 && id < IDC_CLEAR1 + kExodusPackChannels) {
-                mod->SetMap(mod->selectedTile, id - IDC_CLEAR1, nullptr);
+                mod->SetMap(mod->selectedObject, mod->selectedTile, id - IDC_CLEAR1, nullptr);
                 return TRUE;
             }
             if (id == IDC_OUT_DIR_BROWSE) {
@@ -416,10 +581,25 @@ ParamBlockDesc2 packPbDesc(kParams, _M("parameters"), IDS_PARAMETERS, &packDesc,
         p_end,
     kMapFiles, _M("mapFiles"), TYPE_STRING_TAB, 0, P_VARIABLE_SIZE, IDS_MAP_FILES,
         p_end,
+    kMapObjects, _M("mapObjects"), TYPE_STRING_TAB, 0, P_VARIABLE_SIZE, IDS_MAP_OBJECTS,
+        p_end,
+    kCollapsed, _M("collapsedObjects"), TYPE_STRING_TAB, 0, P_VARIABLE_SIZE, IDS_COLLAPSED_OBJECTS,
+        p_end,
     p_end);
 // clang-format on
 
+// Maps are set per object by name, so they follow a renamed object.
+void on_node_renamed(void*, NotifyInfo* info) {
+    const NameChange* change = GetNotifyParam<NOTIFY_NODE_RENAMED>(info);
+    if (!change || !change->oldname || !change->newname) return;
+    const std::vector<PackMod*> mods(packInstances.begin(), packInstances.end());  // a rename can notify
+    for (PackMod* mod : mods)
+        if (packInstances.count(mod)) mod->RenameObject(change->oldname, change->newname);
+}
+
 PackMod::PackMod() {
+    static const bool watching = RegisterNotification(on_node_renamed, nullptr, NOTIFY_NODE_RENAMED) != 0;
+    (void)watching;
     packInstances.insert(this);
     packDesc.MakeAutoParamBlocks(this);
 }

@@ -19,13 +19,13 @@ endfunction()
 # replace it while Max is running and exodus.reload() picks it up.
 add_library(exodus_maxcore SHARED maxcore.cpp)
 exodus_max_settings(exodus_maxcore)
-target_link_libraries(exodus_maxcore PRIVATE exodus_core core maxutil geom mesh mnmath poly paramblk2 bmm)
+target_link_libraries(exodus_maxcore PRIVATE exodus_core core maxutil geom mesh mnmath poly paramblk2 bmm Maxscrpt)
 set_target_properties(exodus_maxcore PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/max/core/$<0:>")
 
 # The plugin Max loads at startup (registered through Plugin.UserSettings.ini, see README).
 add_library(exodus_max SHARED plugin.cpp reduce.cpp pack.cpp exodus.rc plugin.def)
 exodus_max_settings(exodus_max)
-target_link_libraries(exodus_max PRIVATE core maxutil geom mesh mnmath poly paramblk2 gup)
+target_link_libraries(exodus_max PRIVATE core maxutil geom mesh mnmath poly paramblk2 gup Maxscrpt)
 set_target_properties(exodus_max PROPERTIES
     OUTPUT_NAME "exodus"
     SUFFIX ".gup"

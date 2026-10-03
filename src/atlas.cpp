@@ -192,6 +192,7 @@ bool Packer::source_image(const Source& s, int ch, Image& out) {
     if (!load_image(s.tex[ch], out)) return false;
     if (out.w != s.baseW || out.h != s.baseH) out = upscale_nearest(out, s.baseW / out.w, s.baseH / out.h);
     for (int i = 0; i < s.shift; ++i) out = downsample2(out);
+    if (out.w != s.W || out.h != s.H) out = resample(out, s.W, s.H);  // pack_fill's grid
     return true;
 }
 
@@ -267,6 +268,7 @@ void Packer::decimate() {
     d.normalWeight = o.normalWeight;
     d.uvWeight = o.uvWeight;
     d.lockBorder = o.lockBorder;
+    d.symmetry = o.symmetricDecimate;
     d.keep.assign(scene.materials.size(), 0);
     for (const std::string& g : o.noDecimate) {
         int hits = 0;
@@ -276,14 +278,19 @@ void Packer::decimate() {
     }
     char limit[32] = "none";
     if (d.maxError >= 0) std::snprintf(limit, sizeof limit, "%g%%", d.maxError * 100);
-    say("  %zu triangles in, target %s, error limit %s%s\n", input,
-        d.targetTris ? std::to_string(d.targetTris).c_str() : "none", limit, d.lockBorder ? ", borders locked" : "");
+    say("  %zu triangles in, target %s, error limit %s%s%s\n", input,
+        d.targetTris ? std::to_string(d.targetTris).c_str() : "none", limit, d.lockBorder ? ", borders locked" : "",
+        d.symmetry ? ", symmetric" : "");
 
     auto t0 = Clock::now();
     dec = decimate_scene(scene, drop, d);
     decimated = true;
-    for (const DecimateResult::Mesh& m : dec.meshes)
-        if (m.before) say("  %-40s tris %7zu -> %7zu\n", m.name.c_str(), m.before, m.after);
+    for (const DecimateResult::Mesh& m : dec.meshes) {
+        if (!m.before) continue;
+        say("  %-40s tris %7zu -> %7zu", m.name.c_str(), m.before, m.after);
+        if (m.mirrorAxis >= 0) say("  mirror %c on %.1f%% of the faces", "xyz"[m.mirrorAxis], m.mirrored * 100);
+        say("\n");
+    }
     say("  total %zu -> %zu triangles (%zu simplifier vertices), error %.3g%% of model size, uv weight %.3g, %.0f ms\n",
         dec.before, dec.after, dec.vertices, dec.error * 100, dec.uvWeight,
         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
@@ -580,6 +587,58 @@ bool Packer::pack() {
     return false;
 }
 
+bool Packer::pack_fill() {
+    const int W = o.sizeW, H = o.sizeH;
+    if (W <= 0 || H <= 0 || W % o.cell || H % o.cell) {
+        say("fill needs a size that divides by --cell\n");
+        return false;
+    }
+    pad = (o.padding + 1) / 2;
+    auto rebuild = [&](double g) {
+        for (Source& s : sources) {
+            s.W = std::max(1, (int)std::lround((s.baseW >> s.shift) * g));
+            s.H = std::max(1, (int)std::lround((s.baseH >> s.shift) * g));
+        }
+        islands.clear();
+        build_islands();
+    };
+    auto fits = [&](double g, double* need = nullptr) {
+        rebuild(g);
+        std::vector<PackItem> items;
+        double area = 0;
+        for (const Island& isl : islands) {
+            items.push_back(build_item(isl.mask, isl.w, isl.h, pad, o.cell));
+            area += (double)items.back().rot[0].cells * o.cell * o.cell;
+        }
+        if (need) *need = area;
+        if (area > (double)W * H) return false;
+        std::vector<Placement> pl;
+        return pack_items(items, W / o.cell, H / o.cell, o.rotate, pl, nullptr);
+    };
+    // A first guess from the area at the sources' own size, then halve the gap to the largest fit.
+    auto t0 = Clock::now();
+    double need1 = 0;
+    fits(1.0, &need1);
+    double lo = 0, hi = 0, g = std::sqrt(0.85 * W * H / std::max(need1, 1.0));
+    for (int i = 0; i < 12 && (lo == 0 || hi == 0); ++i) {
+        if (fits(g)) { lo = g; g *= 1.08; }
+        else { hi = g; g *= 0.92; }
+    }
+    if (lo == 0) {
+        say("islands do not fit %dx%d even at %.3f of their size\n", W, H, hi);
+        return false;
+    }
+    for (int i = 0; i < 10 && hi > 0 && hi / lo > 1.005; ++i) {
+        const double m = std::sqrt(lo * hi);
+        if (fits(m)) lo = m; else hi = m;
+    }
+    fillScale = lo;
+    rebuild(lo);
+    say("  fill %dx%d: islands at %.3f of their source size (%.0f ms)\n", W, H, lo,
+        std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    return pack();
+}
+
 // New UV of a tile-local source UV. Same math as the pixel copy, in continuous coordinates.
 Vec2d Packer::new_uv(const Island& isl, const Vec2d& uv, Tile t) const {
     const Source& s = sources[isl.source];
@@ -857,9 +916,9 @@ void Packer::write_manifest(const std::vector<std::string>& files) {
     }
     if (decimated)
         std::fprintf(f, "  \"decimation\": {\"triangles_in\": %zu, \"triangles_out\": %zu, \"error\": %.6g, "
-                        "\"normal_weight\": %g, \"uv_weight\": %.6g, \"lock_border\": %s, \"flaps_removed\": %zu},\n",
+                        "\"normal_weight\": %g, \"uv_weight\": %.6g, \"lock_border\": %s, \"symmetric\": %s, \"flaps_removed\": %zu},\n",
                      dec.before, dec.after, dec.error, o.normalWeight, dec.uvWeight, o.lockBorder ? "true" : "false",
-                     dec.flaps);
+                     o.symmetricDecimate ? "true" : "false", dec.flaps);
     std::fprintf(f, "  \"channels\": [\n");
     for (size_t i = 0; i < channels.size(); ++i)
         std::fprintf(f, "    {\"name\": %s, \"file\": %s, \"kind\": \"%s\", \"channels\": %d, \"bits\": %d}%s\n",
@@ -873,7 +932,7 @@ void Packer::write_manifest(const std::vector<std::string>& files) {
     std::fprintf(f, "],\n  \"sources\": [\n");
     for (size_t si = 0; si < sources.size(); ++si) {
         const Source& s = sources[si];
-        std::fprintf(f, "    {\"id\": %zu, \"size\": [%d, %d], \"scale\": %g, \"materials\": [", si, s.W, s.H, std::ldexp(1.0, -s.shift));
+        std::fprintf(f, "    {\"id\": %zu, \"size\": [%d, %d], \"scale\": %g, \"materials\": [", si, s.W, s.H, (double)s.W / s.baseW);
         for (size_t k = 0; k < s.materials.size(); ++k)
             std::fprintf(f, "%s%s", k ? ", " : "", json_str(scene.materials[s.materials[k]].name).c_str());
         std::fprintf(f, "], \"maps\": {");

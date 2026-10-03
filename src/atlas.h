@@ -19,6 +19,7 @@
 struct PackOptions {
     std::string input, outDir, prefix, uvSet;
     int sizeW = 0, sizeH = 0;  // 0 = smallest power-of-two size that fits
+    bool fill = false;         // with a size: every island scaled by one factor to fill it (pack_fill)
     int maxSize = 16384;
     int padding = 8;
     int cell = 4;
@@ -39,6 +40,7 @@ struct PackOptions {
     double maxError = -1;   // relative to model size; < 0 = unbounded
     double normalWeight = 0.5, uvWeight = -1;  // uvWeight < 0 = automatic
     bool lockBorder = false;
+    bool symmetricDecimate = false;  // decimate mirror-symmetric meshes symmetrically
     std::vector<std::string> noDecimate;       // material globs left at full detail
     // subdivision: runs before decimation
     int unsubdivide = 0;    // Catmull-Clark levels to reverse
@@ -142,6 +144,11 @@ struct Packer {
 
     // ---- 3. pack -------------------------------------------------------------------------------
     bool pack();
+
+    // Fills o.sizeW x o.sizeH: the cutting grid of every source scaled by the largest one factor
+    // whose islands still pack (the maps are resampled to it), then packed. Islands are rebuilt.
+    bool pack_fill();
+    double fillScale = 1;  // the factor pack_fill found
 
     // New UV of a tile-local source UV. Same math as the pixel copy, in continuous coordinates.
     Vec2d new_uv(const Island& isl, const Vec2d& uv, Tile t) const;

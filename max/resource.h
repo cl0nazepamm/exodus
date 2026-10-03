@@ -29,6 +29,9 @@
 #define IDS_ASSIGN_MAP 26
 #define IDS_CHOOSE_OUT_DIR 27
 #define IDS_QUAD_DOMINANT 28
+#define IDS_LOCK_SMOOTHING 29
+#define IDS_MAP_OBJECTS 30
+#define IDS_COLLAPSED_OBJECTS 31
 
 #define IDD_UNSUBDIVIDE 101
 #define IDD_DECIMATE 102
@@ -64,3 +67,5 @@
 #define IDC_FILE1 1060     // .. 1065: file of the selected tile
 #define IDC_CLEAR1 1070    // .. 1075
 #define IDC_QUAD_DOMINANT 1080
+#define IDC_LOCK_SMOOTHING 1081
+#define IDC_OBJECT 1082

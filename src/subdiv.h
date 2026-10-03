@@ -65,3 +65,7 @@ SubdivReport unsubdivide_scene(InScene& scene, const UnsubdivideOptions& opt);
 // Forward Catmull-Clark, `levels` times. Positions, UVs and normals are all subdivided (UVs and
 // normals as face-varying data: UV seams and hard normal edges act as boundaries).
 SubdivReport subdivide_scene(InScene& scene, int levels);
+
+// The mirror image of every position of `m` (itself on the mirror plane, UINT32_MAX where there is
+// none), found on the topology the way coarsening finds it; `axis` gets the axis (-1 = none).
+std::vector<uint32_t> mirror_positions(const InMesh& m, int& axis);

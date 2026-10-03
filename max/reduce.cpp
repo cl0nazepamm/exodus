@@ -20,7 +20,7 @@ const Class_ID kDecimateClassId(0x14524858, 0xf249c598);
 
 enum { kParams };
 enum { kLevels, kSymmetry, kQuadDominant };  // Unsubdivide
-enum { kPercent, kLockBorder };     // Decimate
+enum { kPercent, kLockBorder, kDecimateSymmetry, kLockSmoothing };  // Decimate
 
 // Save chunks of the per-node data.
 enum : USHORT { kChunkBones = 0x200, kChunkBone, kChunkWeights, kChunkSynced };
@@ -216,10 +216,13 @@ public:
     bool Run(const ExodusCoreApi& core, TimeValue t, Interval& valid, ModContext& mc, INode* node, MNMesh& mesh, ExodusReduceState& state,
              std::wstring& text, INode*& owner) override {
         float percent = 50;
-        BOOL lockBorder = FALSE;
+        BOOL lockBorder = FALSE, symmetry = TRUE, lockSmoothing = FALSE;
         pblock->GetValue(kPercent, t, percent, valid);
         pblock->GetValue(kLockBorder, t, lockBorder, valid);
-        return core.decimate_modify(this, mc, node, mesh, ExodusDecimate{percent, lockBorder != FALSE}, state, is_reducer, text, owner);
+        pblock->GetValue(kDecimateSymmetry, t, symmetry, valid);
+        pblock->GetValue(kLockSmoothing, t, lockSmoothing, valid);
+        return core.decimate_modify(this, mc, node, mesh, ExodusDecimate{percent, lockBorder != FALSE, symmetry != FALSE, lockSmoothing != FALSE},
+                                    state, is_reducer, text, owner);
     }
 };
 
@@ -236,6 +239,14 @@ ParamBlockDesc2 decimatePbDesc(kParams, _M("parameters"), IDS_PARAMETERS, &decim
     kLockBorder, _M("lockBorder"), TYPE_BOOL, 0, IDS_LOCK_BORDER,
         p_default, FALSE,
         p_ui, TYPE_SINGLECHECKBOX, IDC_LOCK_BORDER,
+        p_end,
+    kDecimateSymmetry, _M("symmetry"), TYPE_BOOL, 0, IDS_SYMMETRY,
+        p_default, TRUE,
+        p_ui, TYPE_SINGLECHECKBOX, IDC_SYMMETRY,
+        p_end,
+    kLockSmoothing, _M("lockSmoothing"), TYPE_BOOL, 0, IDS_LOCK_SMOOTHING,
+        p_default, FALSE,
+        p_ui, TYPE_SINGLECHECKBOX, IDC_LOCK_SMOOTHING,
         p_end,
     p_end);
 // clang-format on

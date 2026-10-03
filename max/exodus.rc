@@ -16,18 +16,20 @@ BEGIN
     LTEXT           "", IDC_STATUS, 6, 52, 96, 28
 END
 
-IDD_DECIMATE DIALOGEX 0, 0, 108, 70
+IDD_DECIMATE DIALOGEX 0, 0, 108, 120
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "MS Sans Serif", 0, 0, 0x0
 BEGIN
     LTEXT           "Keep %:", -1, 6, 8, 30, 8
     CONTROL         "", IDC_PERCENT_EDIT, "CustEdit", WS_TABSTOP, 40, 6, 34, 10
     CONTROL         "", IDC_PERCENT_SPIN, "SpinnerControl", 0x0, 75, 6, 7, 10
-    CONTROL         "Lock borders", IDC_LOCK_BORDER, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 6, 22, 70, 10
-    LTEXT           "", IDC_STATUS, 6, 38, 96, 28
+    CONTROL         "Symmetry", IDC_SYMMETRY, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 6, 22, 70, 10
+    CONTROL         "Lock borders", IDC_LOCK_BORDER, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 6, 35, 70, 10
+    CONTROL         "Lock smoothing groups", IDC_LOCK_SMOOTHING, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 6, 48, 96, 10
+    LTEXT           "", IDC_STATUS, 6, 64, 96, 52
 END
 
-IDD_UDIMPACK DIALOGEX 0, 0, 108, 436
+IDD_UDIMPACK DIALOGEX 0, 0, 108, 450
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "MS Sans Serif", 0, 0, 0x0
 BEGIN
@@ -60,34 +62,36 @@ BEGIN
     COMBOBOX        IDC_KIND1 + 4, 58, 147, 46, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
     CONTROL         "", IDC_CHANNEL1 + 5, "CustEdit", WS_TABSTOP, 4, 161, 52, 10
     COMBOBOX        IDC_KIND1 + 5, 58, 160, 46, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "UDIM tiles:", -1, 4, 177, 100, 8
-    LISTBOX         IDC_TILES, 4, 187, 100, 50, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER | WS_TABSTOP
-    LTEXT           "", IDC_TILE_LABEL, 4, 241, 100, 8
-    LTEXT           "", IDC_FILE_LABEL1 + 0, 4, 253, 32, 8
-    PUSHBUTTON      "", IDC_FILE1 + 0, 37, 251, 57, 11
-    PUSHBUTTON      "x", IDC_CLEAR1 + 0, 95, 251, 9, 11
-    LTEXT           "", IDC_FILE_LABEL1 + 1, 4, 266, 32, 8
-    PUSHBUTTON      "", IDC_FILE1 + 1, 37, 264, 57, 11
-    PUSHBUTTON      "x", IDC_CLEAR1 + 1, 95, 264, 9, 11
-    LTEXT           "", IDC_FILE_LABEL1 + 2, 4, 279, 32, 8
-    PUSHBUTTON      "", IDC_FILE1 + 2, 37, 277, 57, 11
-    PUSHBUTTON      "x", IDC_CLEAR1 + 2, 95, 277, 9, 11
-    LTEXT           "", IDC_FILE_LABEL1 + 3, 4, 292, 32, 8
-    PUSHBUTTON      "", IDC_FILE1 + 3, 37, 290, 57, 11
-    PUSHBUTTON      "x", IDC_CLEAR1 + 3, 95, 290, 9, 11
-    LTEXT           "", IDC_FILE_LABEL1 + 4, 4, 305, 32, 8
-    PUSHBUTTON      "", IDC_FILE1 + 4, 37, 303, 57, 11
-    PUSHBUTTON      "x", IDC_CLEAR1 + 4, 95, 303, 9, 11
-    LTEXT           "", IDC_FILE_LABEL1 + 5, 4, 318, 32, 8
-    PUSHBUTTON      "", IDC_FILE1 + 5, 37, 316, 57, 11
-    PUSHBUTTON      "x", IDC_CLEAR1 + 5, 95, 316, 9, 11
-    LTEXT           "Output folder:", -1, 4, 333, 100, 8
-    CONTROL         "", IDC_OUT_DIR, "CustEdit", WS_TABSTOP, 4, 343, 86, 10
-    PUSHBUTTON      "...", IDC_OUT_DIR_BROWSE, 92, 342, 12, 11
-    LTEXT           "Prefix:", -1, 4, 358, 28, 8
-    CONTROL         "", IDC_PREFIX, "CustEdit", WS_TABSTOP, 34, 356, 70, 10
-    PUSHBUTTON      "Bake atlas", IDC_BAKE, 4, 370, 100, 14
-    LTEXT           "", IDC_STATUS, 4, 388, 100, 44
+    LTEXT           "Object:", -1, 4, 179, 26, 8
+    COMBOBOX        IDC_OBJECT, 32, 177, 72, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "UDIM tiles:", -1, 4, 191, 100, 8
+    LISTBOX         IDC_TILES, 4, 201, 100, 50, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER | WS_TABSTOP
+    LTEXT           "", IDC_TILE_LABEL, 4, 255, 100, 8
+    LTEXT           "", IDC_FILE_LABEL1 + 0, 4, 267, 32, 8
+    PUSHBUTTON      "", IDC_FILE1 + 0, 37, 265, 57, 11
+    PUSHBUTTON      "x", IDC_CLEAR1 + 0, 95, 265, 9, 11
+    LTEXT           "", IDC_FILE_LABEL1 + 1, 4, 280, 32, 8
+    PUSHBUTTON      "", IDC_FILE1 + 1, 37, 278, 57, 11
+    PUSHBUTTON      "x", IDC_CLEAR1 + 1, 95, 278, 9, 11
+    LTEXT           "", IDC_FILE_LABEL1 + 2, 4, 293, 32, 8
+    PUSHBUTTON      "", IDC_FILE1 + 2, 37, 291, 57, 11
+    PUSHBUTTON      "x", IDC_CLEAR1 + 2, 95, 291, 9, 11
+    LTEXT           "", IDC_FILE_LABEL1 + 3, 4, 306, 32, 8
+    PUSHBUTTON      "", IDC_FILE1 + 3, 37, 304, 57, 11
+    PUSHBUTTON      "x", IDC_CLEAR1 + 3, 95, 304, 9, 11
+    LTEXT           "", IDC_FILE_LABEL1 + 4, 4, 319, 32, 8
+    PUSHBUTTON      "", IDC_FILE1 + 4, 37, 317, 57, 11
+    PUSHBUTTON      "x", IDC_CLEAR1 + 4, 95, 317, 9, 11
+    LTEXT           "", IDC_FILE_LABEL1 + 5, 4, 332, 32, 8
+    PUSHBUTTON      "", IDC_FILE1 + 5, 37, 330, 57, 11
+    PUSHBUTTON      "x", IDC_CLEAR1 + 5, 95, 330, 9, 11
+    LTEXT           "Output folder:", -1, 4, 347, 100, 8
+    CONTROL         "", IDC_OUT_DIR, "CustEdit", WS_TABSTOP, 4, 357, 86, 10
+    PUSHBUTTON      "...", IDC_OUT_DIR_BROWSE, 92, 356, 12, 11
+    LTEXT           "Prefix:", -1, 4, 372, 28, 8
+    CONTROL         "", IDC_PREFIX, "CustEdit", WS_TABSTOP, 34, 370, 70, 10
+    PUSHBUTTON      "Bake atlas", IDC_BAKE, 4, 384, 100, 14
+    LTEXT           "", IDC_STATUS, 4, 402, 100, 44
 END
 
 STRINGTABLE
@@ -120,4 +124,7 @@ BEGIN
     IDS_ASSIGN_MAP "Assign map"
     IDS_CHOOSE_OUT_DIR "Atlas output folder"
     IDS_QUAD_DOMINANT "Quad dominant"
+    IDS_LOCK_SMOOTHING "Lock smoothing groups"
+    IDS_MAP_OBJECTS "Map objects"
+    IDS_COLLAPSED_OBJECTS "Collapsed objects"
 END

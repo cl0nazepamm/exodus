@@ -2331,6 +2331,8 @@ void count_faces(const InScene& scene, size_t& faces, size_t& tris) {
 
 }  // namespace
 
+std::vector<uint32_t> mirror_positions(const InMesh& m, int& axis) { return find_mirror(m, axis); }
+
 SubdivReport unsubdivide_scene(InScene& scene, const UnsubdivideOptions& opt) {
     const auto t0 = Clock::now();
     SubdivReport rep;

@@ -1,12 +1,18 @@
 // Exodus for 3ds Max: the work, in a DLL the plugin loads from a copy and can reload
 // (see maxcore_api.h). Everything here runs on Max's main thread, called from the plugin.
 #include <max.h>
+#include <imorpher.h>
 #include <iskin.h>
+#pragma warning(push)
+#pragma warning(disable : 4535)  // the SDK's MAXScript headers call _set_se_translator, which wants /EHa
+#include <maxscript/maxscript.h>
+#pragma warning(pop)
 #include <modstack.h>
 #include <polyobj.h>
 #include <mnmesh.h>
 #include <MNNormalSpec.h>
 #include <stdmat.h>
+#include <triobj.h>
 
 #include <algorithm>
 #include <bit>
@@ -442,6 +448,8 @@ uint64_t decimate_signature(MNMesh& m, const ExodusDecimate& s) {
     Fnv h = settings_hash('D');
     h.add(std::bit_cast<uint32_t>(s.percent));
     h.add(s.lockBorder);
+    h.add(s.symmetry);
+    h.add(s.lockSmoothing);
     return topology_hash(m, h);
 }
 
@@ -458,11 +466,24 @@ bool decimate_plan(MNMesh& m, const ExodusDecimate& s, ExodusPlan& plan) {
     opt.targetTris = std::max<size_t>(1, (size_t)std::llround((double)tris * std::clamp((double)s.percent, 0.0, 100.0) / 100.0));
     opt.maxError = -1;
     opt.lockBorder = s.lockBorder;
+    opt.symmetry = s.symmetry;
+    size_t locked = 0;
+    if (s.lockSmoothing) {  // the hard edges of the smoothing groups stay
+        std::vector<uint32_t> groups(ct.faces.size());
+        for (size_t i = 0; i < ct.faces.size(); ++i) groups[i] = m.F(ct.faces[i])->smGroup;
+        opt.lockPos.push_back(group_border_positions(scene.meshes[0], groups));
+        locked = (size_t)std::count(opt.lockPos[0].begin(), opt.lockPos[0].end(), 1);
+    }
     const DecimateResult r = decimate_scene(scene, std::vector<uint8_t>(maxMaterial + 1, 0), opt);
     if (scene.meshes.empty() || !finish_plan(m, ct, scene.meshes[0], plan)) return false;
     char line[256];
     std::snprintf(line, sizeof line, "%zu -> %zu triangles, error %.3g%%", r.before, r.after, r.error * 100);
     plan.report = line;
+    if (r.meshes[0].mirrorAxis >= 0) {
+        std::snprintf(line, sizeof line, ", mirror %c %.0f%%", "xyz"[r.meshes[0].mirrorAxis], r.meshes[0].mirrored * 100);
+        plan.report += line;
+    }
+    if (s.lockSmoothing) plan.report += ", " + std::to_string(locked) + " smoothing-border vertices kept";
     return true;
 }
 
@@ -842,8 +863,9 @@ bool write_weights(INode* node, Modifier* self, ExodusReduceState& st, const std
 // ------------------------------------------------------------------------------------------------
 // UDIM Pack. One modifier instance sits on every part of a character and the layout is made from
 // all of them, so it is kept here per modifier and each part's evaluation writes its share. The
-// maps come per UDIM tile from the settings: every tile with maps becomes one material of the
-// packer's scene, faces in other tiles are left out. Materials in the scene are not read.
+// maps come per UDIM tile from the settings, for all objects or for one object by name: every
+// tile with maps becomes one material of the packer's scene, an object's own maps one of their
+// own, faces in other tiles are left out. Materials in the scene are not read.
 
 // One node's input: the faces and source UVs the layout is made from.
 struct PackPart {
@@ -851,6 +873,9 @@ struct PackPart {
     int channel = 0;
     InMesh mesh;             // faces (materials set when the scene is put together), source UVs, triangles
     std::vector<UVVert> uvw; // the source map's values, w included
+    bool collapsed = false;  // read from the base object of an object collapsed with the modifier
+    int target = 0;          // collapsed: the target channel read into `baked`
+    std::vector<UVVert> baked;  // collapsed: its target channel per corner of the live faces (the UVs it was packed with)
 };
 
 struct PackUVs {  // one node's packed UVs
@@ -994,6 +1019,64 @@ bool read_part(const PackUse& u, TimeValue t, int channel, PackPart& p, std::str
     return ok;
 }
 
+// A collapsed object's input: its base object, which is the mesh as it was at the modifier, with
+// the packed UVs it got in the target channel.
+bool read_collapsed(INode* node, TimeValue t, const ExodusPackSettings& s, PackPart& p, std::string& err) {
+    Object* base = node->GetObjectRef() ? node->GetObjectRef()->FindBaseObject() : nullptr;
+    ObjectState os = base ? base->Eval(t) : ObjectState();
+    if (!os.obj || !os.obj->CanConvertToType(polyObjectClassID)) {
+        err = "not a mesh";
+        return false;
+    }
+    auto* po = static_cast<PolyObject*>(os.obj->ConvertToType(t, polyObjectClassID));
+    MNMesh& m = po->GetMesh();
+    const bool ok = make_part(m, s.sourceChannel, p, err);
+    if (ok) {
+        p.collapsed = true;
+        p.target = s.targetChannel;
+        MNMap* map = s.targetChannel >= 1 && s.targetChannel < m.MNum() ? m.M(s.targetChannel) : nullptr;
+        if (map && !map->GetFlag(MN_DEAD) && map->FNum() == m.FNum()) {
+            const CornerTable ct = corners_of(m);
+            for (int f : ct.faces)
+                for (int k = 0; k < map->F(f)->deg; ++k) {
+                    const int tv = map->F(f)->tv[k];
+                    p.baked.push_back(tv >= 0 && tv < map->VNum() ? map->v[tv] : UVVert(0, 0, 0));
+                }
+        }
+    }
+    if (po != os.obj) po->MaybeAutoDelete();
+    return ok;
+}
+
+// The collapsed objects (by name; the ones back on the modifier after an undo are uses again)
+// into the parts, read when not read yet. Returns their handles.
+std::set<ULONG> read_collapsed_parts(PackState& st, const std::vector<PackUse>& uses, const ExodusPackSettings& s, TimeValue t, std::string& log) {
+    std::set<ULONG> kept;
+    for (const std::wstring& name : s.collapsed) {
+        INode* n = GetCOREInterface()->GetINodeByName(name.c_str());
+        if (!n || std::any_of(uses.begin(), uses.end(), [&](const PackUse& u) { return u.node == n; })) continue;
+        kept.insert(n->GetHandle());
+        auto it = st.parts.find(n->GetHandle());
+        if (it != st.parts.end() && it->second.collapsed && it->second.channel == s.sourceChannel && it->second.target == s.targetChannel) continue;
+        PackPart part;
+        std::string err;
+        if (read_collapsed(n, t, s, part, err)) {
+            st.parts[n->GetHandle()] = std::move(part);
+        } else {
+            st.parts.erase(n->GetHandle());
+            log += "  ! " + utf8(n->GetName()) + " (collapsed): " + err + "\n";
+        }
+    }
+    return kept;
+}
+
+std::string objects_line(const PackState& st) {
+    const size_t collapsed = (size_t)std::count_if(st.parts.begin(), st.parts.end(), [](const auto& p) { return p.second.collapsed; });
+    std::string line = std::to_string(st.parts.size()) + " object" + (st.parts.size() == 1 ? "" : "s");
+    if (collapsed) line += " (" + std::to_string(collapsed) + " collapsed)";
+    return line;
+}
+
 // The tile of a face, as the packer finds it (the average of its UVs); -1 outside 1001 .. 1999.
 int face_udim(const InMesh& m, const InFace& f) {
     double cu = 0, cv = 0;
@@ -1006,11 +1089,17 @@ int face_udim(const InMesh& m, const InFace& f) {
     return t.u >= 0 && t.u < 10 && t.v >= 0 && t.v < 100 ? udim_number(t) : -1;
 }
 
+std::wstring node_name(ULONG handle) {
+    INode* n = GetCOREInterface()->GetINodeByHandle(handle);
+    return n && n->GetName() ? std::wstring(n->GetName()) : std::wstring();
+}
+
 uint64_t layout_signature(const PackState& st, const ExodusPackSettings& s) {
     Fnv h = settings_hash('P');
     for (const auto& [handle, part] : st.parts) {
         h.add(handle);
         h.add(part.signature);
+        add_text(h, node_name(handle));  // maps are found by name
     }
     h.add((uint64_t)s.size);
     h.add((uint64_t)s.maxSize);
@@ -1021,6 +1110,7 @@ uint64_t layout_signature(const PackState& st, const ExodusPackSettings& s) {
         h.add((uint64_t)s.kind[c]);
     }
     for (const ExodusPackMap& m : s.maps) {
+        add_text(h, m.object);
         h.add((uint64_t)m.tile);
         h.add((uint64_t)m.channel);
         add_text(h, m.file);
@@ -1058,15 +1148,16 @@ PackUVs packed_uvs(const Packer& P, size_t mi, const PackPart& part) {
     return out;
 }
 
-// Tiles in use, from the parts' source UVs and the maps.
-std::vector<ExodusPackTile> pack_tiles(const PackState& st, const ExodusPackSettings& s) {
-    std::map<int, int> faces;
-    for (const auto& [handle, part] : st.parts)
+// Tiles in use per object, from the parts' source UVs (the rollout adds the tiles with maps).
+std::vector<ExodusPackTile> pack_tiles(const PackState& st) {
+    std::map<std::pair<std::wstring, int>, int> faces;
+    for (const auto& [handle, part] : st.parts) {
+        const std::wstring name = node_name(handle);
         for (const InFace& f : part.mesh.faces)
-            if (const int udim = face_udim(part.mesh, f); udim > 0) ++faces[udim];
-    for (const ExodusPackMap& m : s.maps) faces.try_emplace(m.tile, 0);
+            if (const int udim = face_udim(part.mesh, f); udim > 0) ++faces[{name, udim}];
+    }
     std::vector<ExodusPackTile> tiles;
-    for (auto [tile, n] : faces) tiles.push_back({tile, n});
+    for (const auto& [key, n] : faces) tiles.push_back({key.first, key.second, n});
     return tiles;
 }
 
@@ -1083,7 +1174,7 @@ void make_layout(PackState& st, const ExodusPackSettings& s) {
     st.packer.reset();
     st.uvs.clear();
     st.log.clear();
-    st.tiles = pack_tiles(st, s);
+    st.tiles = pack_tiles(st);
     if (st.parts.empty()) {
         st.report = "no mesh with UVs";
         return;
@@ -1092,19 +1183,21 @@ void make_layout(PackState& st, const ExodusPackSettings& s) {
     auto P = std::make_unique<Packer>();
     PackOptions& o = P->o;
     o.sizeW = o.sizeH = s.size;
+    o.fill = s.size > 0;  // a size is filled: the islands scaled to it (0: their own size, smallest atlas)
     o.maxSize = s.maxSize;
     o.padding = s.padding;
     o.rotate = s.rotate;
     o.obj = false;
     InScene& scene = P->scene;
-    // Material 0 holds the faces of tiles without maps, left out; then one per tile with maps.
+    // Material 0 holds the faces of tiles without maps, left out; then one per tile with maps for
+    // all objects and one per object and tile with maps of its own.
     scene.materials.push_back({"<no maps>"});
     o.excludes.push_back("<no maps>");
-    std::map<int, uint32_t> tileMaterial;
+    std::map<std::pair<std::wstring, int>, uint32_t> tileMaterial;  // (object, empty = all; tile) -> material
     for (const ExodusPackMap& m : s.maps) {
         if (m.channel < 0 || m.channel >= kExodusPackChannels || s.channel[m.channel].empty() || m.file.empty()) continue;
-        auto [it, fresh] = tileMaterial.try_emplace(m.tile, (uint32_t)scene.materials.size());
-        if (fresh) scene.materials.push_back({std::to_string(m.tile)});
+        auto [it, fresh] = tileMaterial.try_emplace({m.object, m.tile}, (uint32_t)scene.materials.size());
+        if (fresh) scene.materials.push_back({(m.object.empty() ? "" : utf8(m.object.c_str()) + " ") + std::to_string(m.tile)});
         InTexture tex;
         tex.channel = utf8(s.channel[m.channel].c_str());
         tex.path = utf8(m.file.c_str());
@@ -1121,13 +1214,21 @@ void make_layout(PackState& st, const ExodusPackSettings& s) {
         return;
     }
 
+    // A face takes its object's own maps in its tile, else the maps for all objects there.
     std::vector<ULONG> order;
+    std::set<uint32_t> used;
+    std::map<std::wstring, int> named;  // objects per name
     for (const auto& [handle, part] : st.parts) {
         InMesh mesh = part.mesh;
-        if (INode* n = GetCOREInterface()->GetINodeByHandle(handle)) mesh.name = utf8(n->GetName());
+        const std::wstring name = node_name(handle);
+        mesh.name = utf8(name.c_str());
+        ++named[name];
         for (InFace& f : mesh.faces) {
-            auto it = tileMaterial.find(face_udim(mesh, f));
+            const int udim = face_udim(mesh, f);
+            auto it = tileMaterial.find({name, udim});
+            if (it == tileMaterial.end()) it = tileMaterial.find({std::wstring(), udim});
             f.material = it == tileMaterial.end() ? 0 : it->second;
+            if (f.material) used.insert(f.material);
         }
         scene.meshes.push_back(std::move(mesh));
         order.push_back(handle);
@@ -1139,17 +1240,34 @@ void make_layout(PackState& st, const ExodusPackSettings& s) {
         return;
     }
     P->build_islands();
-    if (!P->pack()) {
+    if (!(o.fill ? P->pack_fill() : P->pack())) {
         st.report = last_line(st.log);
         return;
     }
     for (size_t mi = 0; mi < order.size(); ++mi) st.uvs[order[mi]] = packed_uvs(*P, mi, st.parts[order[mi]]);
     char line[256];
-    std::snprintf(line, sizeof line, "%zu tile%s, %zu islands, %dx%d atlas, %zu map%s", tileMaterial.size(), tileMaterial.size() == 1 ? "" : "s",
+    std::snprintf(line, sizeof line, "%zu tile%s, %zu islands, %dx%d atlas, %zu map%s", used.size(), used.size() == 1 ? "" : "s",
                   P->islands.size(), P->AW, P->AH, P->channels.size(), P->channels.size() == 1 ? "" : "s");
     st.report = line;
+    if (o.fill) {
+        std::snprintf(line, sizeof line, ", filled at %.0f%% of the maps' size", P->fillScale * 100);
+        st.report += line;
+    }
     // The first warning, if any: unreadable maps, maps of one tile at unrelated sizes, ...
     if (const size_t w = st.log.find("  ! "); w != std::string::npos) st.report += "\n" + st.log.substr(w + 4, st.log.find('\n', w) - w - 4);
+    for (const auto& [name, n] : named)
+        if (n > 1 && !name.empty() && std::any_of(s.maps.begin(), s.maps.end(), [&](const ExodusPackMap& m) { return m.object == name; }))
+            st.report += "\n" + std::to_string(n) + " objects are named '" + utf8(name.c_str()) + "': they share its maps";
+    // A collapsed object keeps the UVs it was packed with: if this layout gives it others (settings
+    // or maps changed since), it no longer matches the atlas.
+    for (const auto& [handle, part] : st.parts) {
+        if (!part.collapsed) continue;
+        const PackUVs& uv = st.uvs[handle];
+        bool same = uv.tv.size() == part.baked.size();
+        for (size_t c = 0; same && c < uv.tv.size(); ++c)
+            same = std::abs(uv.verts[uv.tv[c]].x - part.baked[c].x) < 1e-6f && std::abs(uv.verts[uv.tv[c]].y - part.baked[c].y) < 1e-6f;
+        if (!same) st.report += "\n" + utf8(node_name(handle).c_str()) + " was collapsed with another layout: its UVs do not match this one";
+    }
     for (int c = 0; c < kExodusPackChannels; ++c) {
         std::wstring low = s.channel[c];
         for (wchar_t& ch : low) ch = (wchar_t)towlower(ch);
@@ -1208,15 +1326,17 @@ bool pack_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, cons
     for (const PackUse& u : uses) {
         if (u.node == node) continue;
         auto it = st.parts.find(u.node->GetHandle());
-        if (it != st.parts.end() && it->second.channel == s.sourceChannel) continue;
+        if (it != st.parts.end() && it->second.channel == s.sourceChannel && !it->second.collapsed) continue;
         PackPart part;
         std::string ignore;
         if (read_part(u, t, s.sourceChannel, part, ignore)) st.parts[u.node->GetHandle()] = std::move(part);
         else st.parts.erase(u.node->GetHandle());
     }
+    std::string ignore;
+    const std::set<ULONG> kept = read_collapsed_parts(st, uses, s, t, ignore);
     for (auto it = st.parts.begin(); it != st.parts.end();) {
         const bool used = std::any_of(uses.begin(), uses.end(), [&](const PackUse& u) { return u.node->GetHandle() == it->first; }) ||
-                          (node && node->GetHandle() == it->first);
+                          (node && node->GetHandle() == it->first) || kept.count(it->first);
         it = used ? std::next(it) : st.parts.erase(it);
     }
 
@@ -1237,7 +1357,18 @@ bool pack_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, cons
         auto it = st.uvs.find(node->GetHandle());
         if (it == st.uvs.end() || !write_uvs(mesh, s.targetChannel, it->second)) report += "\nthe layout does not fit this mesh";
     }
-    report += "\n" + std::to_string(st.parts.size()) + " part" + (st.parts.size() == 1 ? "" : "s");
+    report += "\n" + objects_line(st);
+    // Collapse To this modifier bakes everything below it into the mesh: say so for Skin and Morpher.
+    for (const PackUse& u : uses) {
+        if (u.node != node) continue;
+        std::string below;
+        for (int i = u.index + 1; i < u.owner->NumModifiers(); ++i) {
+            const Class_ID id = u.owner->GetModifier(i)->ClassID();
+            const char* name = id == Class_ID(9815843, 87654) ? "Skin" : id == Class_ID(0x17bb6854, 0xa5cba2a3) ? "Morpher" : nullptr;  // iskin.h, imorpher.h
+            if (name) below += (below.empty() ? "" : ", ") + std::string(name);
+        }
+        if (!below.empty()) report += "\n" + below + " below: Collapse To here would bake it (move UDIM Pack under it)";
+    }
     status = wide(report);
     return changed && uses.size() > 1;
 }
@@ -1258,11 +1389,13 @@ bool pack_bake(Modifier* self, const ExodusPackSettings& s, ExodusSink out, std:
     const TimeValue t = GetCOREInterface()->GetTime();
     st.parts.clear();
     std::string log, err;
-    for (const PackUse& u : uses_of(self)) {
+    const std::vector<PackUse> uses = uses_of(self);
+    for (const PackUse& u : uses) {
         PackPart part;
         if (read_part(u, t, s.sourceChannel, part, err)) st.parts[u.node->GetHandle()] = std::move(part);
         else log += "  ! " + utf8(u.node->GetName()) + ": " + err + "\n";
     }
+    read_collapsed_parts(st, uses, s, t, log);
     const uint64_t signature = layout_signature(st, s);
     if (signature != st.layout || !st.packer) {
         make_layout(st, s);
@@ -1305,7 +1438,13 @@ bool pack_bake(Modifier* self, const ExodusPackSettings& s, ExodusSink out, std:
     char line[512];
     std::snprintf(line, sizeof line, "baked %zu map%s %dx%d, %zu of %zu samples differ\n%s", P.channels.size(), P.channels.size() == 1 ? "" : "s",
                   P.AW, P.AH, P.verifyMismatches, P.verifySamples, P.o.outDir.c_str());
-    status = wide(line);
+    std::string text = line;
+    for (size_t at = st.report.find(" was collapsed with another layout"); at != std::string::npos;
+         at = st.report.find(" was collapsed with another layout", at + 1)) {
+        const size_t from = st.report.rfind('\n', at) + 1;
+        text += "\n" + st.report.substr(from, st.report.find('\n', at) - from);
+    }
+    status = wide(text);
     return P.verifyMismatches == 0;
 }
 
@@ -1314,8 +1453,576 @@ void pack_forget(Modifier* self) {
     packs.erase(self);
 }
 
+// ------------------------------------------------------------------------------------------------
+// Merge. Attach takes the posed mesh, drops the attached object's Skin and morphs and leaves the
+// target's Skin guessing weights for the new vertices. Here each object's mesh is taken at the
+// input of its Skin with its Morpher off (the bind shape), moved into the first object's space at
+// the bind pose and appended in order, so every vertex has a known place. One Skin gets every bone
+// with the bind pose the objects were skinned with, every vertex its own weights and dual
+// quaternion blend; one Morpher gets every channel (channels of the same name, targets and values
+// become one), built from target meshes as Morpher's own pick does. Map channels, explicit normals,
+// smoothing groups and material IDs are carried (different materials go into a Multi/Sub). The
+// objects are hidden, not deleted.
+
+struct MergeSource {
+    INode* node = nullptr;
+    Modifier* skinMod = nullptr;
+    ISkin* skin = nullptr;
+    ISkinContextData* ctx = nullptr;
+    int skinIndex = 0;               // 1-based in MAXScript's modifiers array (top first)
+    Modifier* morphMod = nullptr;
+    IMorpher* morpher = nullptr;
+    int morphIndex = 0;
+    std::vector<Point3> morphBase;   // the input of Morpher (progressive targets are points relative to it)
+    std::vector<std::string> above;  // modifiers above Skin: not carried
+    MNMesh mesh;                     // at the input of Skin with the morphs off, in its object space
+    Matrix3 toMerged;                // its object space at the bind pose -> the merged object's
+    std::vector<int> vertex;         // its vertex -> merged vertex (-1: dead)
+};
+
+struct MergeBone {
+    INode* node;
+    Matrix3 objectTm, nodeTm, stretchTm;  // at the bind pose
+    size_t from;                          // the first object skinned to it
+};
+
+struct MergeChannel {
+    std::wstring name;
+    std::vector<double> percents;                 // per target (0: the main one)
+    std::vector<std::pair<size_t, int>> parts;    // (object, its channel)
+};
+
+struct IdMap {  // an object's material IDs in the merged object
+    int offset = 0, count = -1;  // count < 0: kept; 0: all to `offset`; else offset + id % count (as Multi/Sub picks)
+    MtlID operator()(MtlID id) const { return (MtlID)(count < 0 ? id : offset + (count ? id % count : 0)); }
+};
+
+// Two bind matrices alike: the axes within 1e-4, the position within 1e-4 of its size.
+bool close_tm(const Matrix3& a, const Matrix3& b) {
+    for (int r = 0; r < 3; ++r)
+        if (Length(a.GetRow(r) - b.GetRow(r)) > 1e-4f * std::max(1.0f, Length(a.GetRow(r)))) return false;
+    return Length(a.GetRow(3) - b.GetRow(3)) <= 1e-4f * std::max(1.0f, Length(a.GetRow(3)));
+}
+
+std::wstring mxs_string(const std::wstring& s) {
+    std::wstring q = L"\"";
+    for (wchar_t c : s) {
+        if (c == L'"' || c == L'\\') q += L'\\';
+        q += c;
+    }
+    return q + L"\"";
+}
+
+bool run_mxs(const std::wstring& code, FPValue* result = nullptr) {
+    return ExecuteMAXScriptScript(code.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, result) != FALSE;
+}
+
+// An object's Skin, Morpher and bind shape.
+bool read_source(INode* node, TimeValue t, MergeSource& s, std::string& err) {
+    s.node = node;
+    std::vector<std::pair<IDerivedObject*, int>> mods;  // top first
+    for (Object* obj = node->GetObjectRef(); obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID;
+         obj = static_cast<IDerivedObject*>(obj)->GetObjRef())
+        for (int i = 0; i < static_cast<IDerivedObject*>(obj)->NumModifiers(); ++i) mods.push_back({static_cast<IDerivedObject*>(obj), i});
+    size_t skinAt = mods.size(), morphAt = mods.size();
+    for (size_t k = 0; k < mods.size(); ++k) {
+        Modifier* m = mods[k].first->GetModifier(mods[k].second);
+        const bool morpher = m->ClassID() == MR3_CLASS_ID;
+        if (skinAt == mods.size()) {
+            if (auto* sk = static_cast<ISkin*>(m->GetInterface(I_SKIN))) {
+                skinAt = k;
+                s.skinMod = m;
+                s.skin = sk;
+                s.skinIndex = (int)k + 1;
+            } else if (morpher) {
+                err = "its Morpher is above Skin";
+                return false;
+            } else {
+                s.above.push_back(utf8(m->GetName(false)));
+            }
+        } else if (morpher) {
+            if (s.morphMod) {
+                err = "it has two Morphers";
+                return false;
+            }
+            s.morphMod = m;
+            s.morpher = static_cast<IMorpher*>(m->GetInterface(I_MORPHER_INTERFACE_ID));
+            s.morphIndex = (int)k + 1;
+            morphAt = k;
+        }
+    }
+    if (!s.skin) {
+        err = "it has no Skin";
+        return false;
+    }
+    const bool morphOn = s.morphMod && s.morphMod->IsEnabled();
+    theHold.Suspend();
+    if (morphOn) s.morphMod->DisableMod();
+    auto [owner, i] = mods[skinAt];
+    ObjectState os = i + 1 < owner->NumModifiers() ? owner->Eval(t, i + 1) : owner->GetObjRef()->Eval(t);
+    const bool ok = os.obj && os.obj->CanConvertToType(polyObjectClassID);
+    if (ok) {
+        auto* po = static_cast<PolyObject*>(os.obj->ConvertToType(t, polyObjectClassID));
+        s.mesh = po->GetMesh();
+        if (po != os.obj) po->MaybeAutoDelete();
+    }
+    if (morphOn) s.morphMod->EnableMod();
+    if (morphAt < mods.size()) {
+        auto [mo, mi] = mods[morphAt];
+        ObjectState ms = mi + 1 < mo->NumModifiers() ? mo->Eval(t, mi + 1) : mo->GetObjRef()->Eval(t);
+        for (int v = 0; ms.obj && v < ms.obj->NumPoints(); ++v) s.morphBase.push_back(ms.obj->GetPoint(v));
+    }
+    theHold.Resume();
+    node->EvalWorldState(t);  // Morpher and Skin as they were
+    if (!ok) {
+        err = "it is not a mesh";
+        return false;
+    }
+    s.ctx = s.skin->GetContextInterface(node);
+    if (!s.ctx || s.ctx->GetNumPoints() != s.mesh.VNum()) {
+        err = "its Skin does not have the vertices of the mesh under it";
+        return false;
+    }
+    return true;
+}
+
+// The objects' materials as one: kept when they share one, else a Multi/Sub with a slot per
+// material (a Multi/Sub's slots in order), as Attach's "match material IDs to material" does.
+Mtl* merged_material(const std::vector<std::unique_ptr<MergeSource>>& src, std::vector<IdMap>& ids) {
+    ids.assign(src.size(), IdMap{});
+    Mtl* first = src[0]->node->GetMtl();
+    if (std::all_of(src.begin(), src.end(), [&](const auto& s) { return s->node->GetMtl() == first; })) return first;
+    std::vector<std::pair<Mtl*, MSTR>> slots;
+    std::map<Mtl*, IdMap> placed;
+    for (size_t i = 0; i < src.size(); ++i) {
+        Mtl* m = src[i]->node->GetMtl();
+        if (auto it = placed.find(m); it != placed.end()) {
+            ids[i] = it->second;
+            continue;
+        }
+        IdMap map{(int)slots.size(), m && m->IsMultiMtl() ? m->NumSubMtls() : 0};
+        if (map.count > 0) {
+            for (int k = 0; k < map.count; ++k) slots.push_back({m->GetSubMtl(k), m->GetSubMtlSlotName(k, false)});
+        } else {
+            slots.push_back({m, MSTR(src[i]->node->GetName())});
+        }
+        ids[i] = placed[m] = map;
+    }
+    MultiMtl* multi = NewDefaultMultiMtl();
+    multi->SetNumSubMtls((int)slots.size());
+    for (int k = 0; k < (int)slots.size(); ++k) multi->SetSubMtlAndName(k, slots[k].first, slots[k].second);
+    multi->SetName(MSTR(src[0]->node->GetName()) + _M("_merged"));
+    return multi;
+}
+
+// The objects' meshes appended in order, in the merged object's space.
+void merge_meshes(std::vector<std::unique_ptr<MergeSource>>& src, const std::vector<IdMap>& ids, MNMesh& out) {
+    int nv = 0, nf = 0, mapNum = 0;
+    for (auto& s : src) {
+        s->vertex.assign(s->mesh.VNum(), -1);
+        for (int v = 0; v < s->mesh.VNum(); ++v)
+            if (!s->mesh.V(v)->GetFlag(MN_DEAD)) s->vertex[v] = nv++;
+        for (int f = 0; f < s->mesh.FNum(); ++f) nf += !s->mesh.F(f)->GetFlag(MN_DEAD);
+        mapNum = std::max(mapNum, s->mesh.MNum());
+    }
+    out.ClearAndFree();
+    out.setNumVerts(nv);
+    out.setNumFaces(nf);
+    int fo = 0;
+    std::vector<int> retriangulate;  // faces whose triangulation could not be copied
+    for (size_t i = 0; i < src.size(); ++i) {
+        MergeSource& s = *src[i];
+        for (int v = 0; v < s.mesh.VNum(); ++v)
+            if (s.vertex[v] >= 0) out.V(s.vertex[v])->p = s.mesh.P(v) * s.toMerged;
+        for (int f = 0; f < s.mesh.FNum(); ++f) {
+            const MNFace* S = s.mesh.F(f);
+            if (S->GetFlag(MN_DEAD)) continue;
+            MNFace* F = out.F(fo++);
+            F->SetDeg(S->deg);
+            for (int k = 0; k < S->deg; ++k) F->vtx[k] = s.vertex[S->vtx[k]];
+            if (S->deg > 3 && S->diag && F->diag)
+                for (int d = 0; d < (S->deg - 3) * 2; ++d) F->diag[d] = S->diag[d];
+            else if (S->deg > 3)
+                retriangulate.push_back(fo - 1);
+            F->material = ids[i](S->material);
+            F->smGroup = S->smGroup;
+        }
+    }
+
+    // Map channels: every channel any object has; an object without it gets one value (white for
+    // vertex color, illumination and alpha, 0 for UVs).
+    out.SetMapNum(mapNum);
+    for (int mp = -NUM_HIDDENMAPS; mp < mapNum; ++mp) {
+        auto live = [&](const MergeSource& s) {
+            const std::vector<int> maps = live_maps(const_cast<MNMesh&>(s.mesh));
+            return std::find(maps.begin(), maps.end(), mp) != maps.end();
+        };
+        if (std::none_of(src.begin(), src.end(), [&](const auto& s) { return live(*s); })) {
+            out.ClearMap(mp);
+            continue;
+        }
+        MNMap* d = out.M(mp);
+        d->ClearAndFree();
+        d->ClearFlag(MN_DEAD);
+        int total = 0;
+        for (auto& s : src) total += live(*s) ? s->mesh.M(mp)->VNum() : 1;
+        d->setNumVerts(total);
+        d->setNumFaces(nf);
+        int vo = 0;
+        fo = 0;
+        for (auto& s : src) {
+            const MNMap* sm = live(*s) ? s->mesh.M(mp) : nullptr;
+            if (sm) for (int v = 0; v < sm->VNum(); ++v) d->v[vo + v] = sm->v[v];
+            else d->v[vo] = mp <= 0 ? UVVert(1, 1, 1) : UVVert(0, 0, 0);
+            for (int f = 0; f < s->mesh.FNum(); ++f) {
+                if (s->mesh.F(f)->GetFlag(MN_DEAD)) continue;
+                MNMapFace* mf = d->F(fo++);
+                mf->SetSize(s->mesh.F(f)->deg);
+                for (int k = 0; k < mf->deg; ++k) mf->tv[k] = vo + (sm ? sm->F(f)->tv[k] : 0);
+            }
+            vo += sm ? sm->VNum() : 1;
+        }
+    }
+    out.FillInMesh();
+    for (int f : retriangulate) out.RetriangulateFace(f);
+
+    // Explicit normals (turned with the object); objects without them get smoothing-group normals.
+    if (std::none_of(src.begin(), src.end(), [](const auto& s) { return live_normals(s->mesh) != nullptr; })) return;
+    out.SpecifyNormals();
+    MNNormalSpec* dn = out.GetSpecifiedNormals();
+    dn->SetParent(&out);
+    int nn = 0;
+    for (auto& s : src)
+        if (MNNormalSpec* sn = live_normals(s->mesh)) nn += sn->GetNumNormals();
+    dn->SetNumFaces(nf);
+    dn->SetNumNormals(nn);
+    int no = 0;
+    fo = 0;
+    for (auto& s : src) {
+        MNNormalSpec* sn = live_normals(s->mesh);
+        if (sn)
+            for (int k = 0; k < sn->GetNumNormals(); ++k) {
+                dn->Normal(no + k) = Normalize(VectorTransform(sn->Normal(k), s->toMerged));
+                dn->SetNormalExplicit(no + k, sn->GetNormalExplicit(k));
+            }
+        for (int f = 0; f < s->mesh.FNum(); ++f) {
+            if (s->mesh.F(f)->GetFlag(MN_DEAD)) continue;
+            MNNormalFace& fn = dn->Face(fo++);
+            fn.SetDegree(s->mesh.F(f)->deg);
+            for (int k = 0; k < s->mesh.F(f)->deg; ++k) {
+                const int id = sn ? sn->Face(f).GetNormalID(k) : -1;
+                fn.SetNormalID(k, id < 0 ? -1 : no + id);
+                fn.SetSpecified(k, sn && id >= 0 && sn->Face(f).GetSpecified(k));
+            }
+        }
+        if (sn) no += sn->GetNumNormals();
+    }
+    dn->CheckNormals();
+}
+
+// A channel's value at every frame of the animation range (its controller, or its constant value).
+std::vector<float> channel_values(IMorpherChannel* ch) {
+    std::vector<float> values;
+    const Interval range = GetCOREInterface()->GetAnimRange();
+    Control* c = ch->GetControl();
+    for (TimeValue t = range.Start(); t <= range.End(); t += GetTicksPerFrame()) {
+        float v = 0;
+        Interval valid = FOREVER;
+        if (c) c->GetValue(t, &v, valid);
+        else v = (float)ch->GetInitPercent();
+        values.push_back(v);
+        if (!c) break;
+    }
+    return values;
+}
+
+// The morph channels of the merged object, in the order the objects and their channels come.
+// Channels of different objects become one when they have the same name, targets (the percents of
+// the progressive ones) and value at every frame, as the parts of one character driven together
+// do; otherwise a channel keeps its own, named after its object when the name is taken.
+std::vector<MergeChannel> merge_channels(const std::vector<std::unique_ptr<MergeSource>>& src, std::string& log) {
+    std::vector<MergeChannel> out;
+    std::vector<std::vector<float>> values;  // per merged channel: its first part's values
+    for (size_t i = 0; i < src.size(); ++i) {
+        IMorpher* mr = src[i]->morpher;
+        for (int c = 0; mr && c < mr->NumChannels(); ++c) {
+            IMorpherChannel* ch = mr->GetChannel(c);
+            if (!ch || !ch->IsActive() || ch->NumPoints() == 0) continue;
+            const MCHAR* nm = ch->GetName(true);  // the name shown (WM3_MC_SetName sets only this one)
+            std::wstring name = nm && *nm ? nm : (ch->GetName(false) ? ch->GetName(false) : L"");
+            if (ch->NumPoints() != src[i]->mesh.VNum()) {
+                log += "  ! " + utf8(MSTR(src[i]->node->GetName())) + ", morph " + utf8(MSTR(name.c_str())) +
+                       ": its points do not match the mesh, left out\n";
+                continue;
+            }
+            std::vector<double> percents;
+            for (int k = 0; k < ch->GetTargetCount(); ++k) percents.push_back(ch->GetTargetPercent(k));
+            const std::vector<float> value = channel_values(ch);
+            size_t at = out.size();
+            for (size_t m = 0; m < out.size() && at == out.size(); ++m)
+                if (out[m].name == name && out[m].percents == percents && values[m] == value &&
+                    std::none_of(out[m].parts.begin(), out[m].parts.end(), [&](const auto& p) { return p.first == i; }))
+                    at = m;
+            if (at == out.size()) {
+                const bool taken = std::any_of(out.begin(), out.end(), [&](const MergeChannel& m) { return m.name == name; });
+                out.push_back({taken ? name + L" (" + src[i]->node->GetName() + L")" : name, percents, {}});
+                values.push_back(value);
+            }
+            out[at].parts.push_back({i, c});
+        }
+    }
+    return out;
+}
+
+// Builds merged channel `index` (1-based) from target meshes: the merged bind shape with each
+// part's offsets for that target, turned into the merged object's space. Morpher moves a point by
+// its stored delta in a channel with one target, and along a spline through its input point and
+// the targets' points in a progressive channel (wm3_core.cpp), so the offsets are those.
+bool build_channel(INode* merged, int morphIndex, int index, const MergeChannel& ch, const std::vector<std::unique_ptr<MergeSource>>& src,
+                   const MNMesh& base, TimeValue t, std::string& log) {
+    const bool progressive = ch.percents.size() > 1;
+    std::vector<INode*> targets;
+    for (size_t k = 0; k < ch.percents.size(); ++k) {
+        TriObject* obj = CreateNewTriObject();
+        Mesh& m = obj->GetMesh();
+        m.setNumVerts(base.VNum());
+        for (int v = 0; v < base.VNum(); ++v) m.setVert(v, base.P(v));
+        for (const auto& [i, c] : ch.parts) {
+            const MergeSource& s = *src[i];
+            IMorpherChannel* sc = s.morpher->GetChannel(c);
+            Tab<Point3> deltas;
+            if (!progressive) {
+                sc->GetBaseDeltas(deltas);
+            } else if (s.morphBase.size() == s.vertex.size()) {
+                deltas.SetCount((int)s.morphBase.size());
+                for (int v = 0; v < deltas.Count(); ++v) deltas[v] = sc->GetTargetPoint((int)k, v) - s.morphBase[v];
+            }
+            for (int v = 0; v < deltas.Count() && v < (int)s.vertex.size(); ++v)
+                if (s.vertex[v] >= 0) m.setVert(s.vertex[v], m.getVert(s.vertex[v]) + VectorTransform(deltas[v], s.toMerged));
+        }
+        INode* node = GetCOREInterface()->CreateObjectNode(obj);
+        node->Hide(TRUE);
+        targets.push_back(node);
+    }
+    // Settings and value (animation, wires) from the channel's first part.
+    const MergeSource& first = *src[ch.parts[0].first];
+    const int j = ch.parts[0].second + 1;
+    std::wstring code = L"(local m = (maxOps.getNodeByHandle " + std::to_wstring(merged->GetHandle()) + L").modifiers[" + std::to_wstring(morphIndex) +
+                        L"]\nlocal s = (maxOps.getNodeByHandle " + std::to_wstring(first.node->GetHandle()) + L").modifiers[" +
+                        std::to_wstring(first.morphIndex) + L"]\nlocal t = #(";
+    for (size_t k = 0; k < targets.size(); ++k) code += (k ? L", " : L"") + std::to_wstring(targets[k]->GetHandle());
+    code += L")\nt = for h in t collect maxOps.getNodeByHandle h\nlocal i = " + std::to_wstring(index) + L"\nlocal j = " + std::to_wstring(j) +
+            L"\nWM3_MC_BuildFromNode m i t[1]\nfor k = 2 to t.count do WM3_AddProgressiveMorphNode m i t[k]\nlocal w = #(";
+    for (size_t k = 0; k < ch.percents.size(); ++k) code += (k ? L", " : L"") + std::to_wstring(ch.percents[k]);
+    code += L")\nif t.count > 1 do (for k = 1 to t.count do WM3_SetProgressiveMorphWeight m i t[k] w[k]; "
+            L"WM3_SetProgressiveMorphTension m i (WM3_GetProgressiveMorphTension s j))\n"
+            L"WM3_MC_SetName m i " + mxs_string(ch.name) +
+            L"\nWM3_MC_SetUseLimits m i (WM3_MC_GetUseLimits s j)\nWM3_MC_SetLimitMIN m i (WM3_MC_GetLimitMIN s j)\n"
+            L"WM3_MC_SetLimitMAX m i (WM3_MC_GetLimitMAX s j)\n"
+            L"try (m[i].controller = copy s[j].controller) catch (WM3_MC_SetValue m i (WM3_MC_GetValue s j))\n"
+            L"WM3_MC_GetUseVertexSel s j)";
+    FPValue r;
+    const bool ok = run_mxs(code, &r);
+    for (INode* n : targets) GetCOREInterface()->DeleteNode(n, FALSE);
+    if (!ok) {
+        log += "  ! morph " + utf8(MSTR(ch.name.c_str())) + ": could not be built\n";
+        return false;
+    }
+    if (r.type == TYPE_BOOL && r.b)
+        log += "  ! morph " + utf8(MSTR(ch.name.c_str())) + " uses a vertex selection in " + utf8(MSTR(first.node->GetName())) +
+               ": the merged channel moves every vertex the target moves\n";
+    return true;
+}
+
+bool merge(const std::vector<INode*>& nodes, ExodusSink out, INode*& mergedOut) {
+    mergedOut = nullptr;
+    std::string log;
+    auto fail = [&](const std::string& why) {
+        log += why + "\n";
+        out.write(out.ctx, log.data(), log.size());
+        return false;
+    };
+    std::vector<INode*> list;
+    for (INode* n : nodes)
+        if (n && std::find(list.begin(), list.end(), n) == list.end()) list.push_back(n);
+    if (list.size() < 2) return fail("select two or more skinned objects");
+    const TimeValue t = GetCOREInterface()->GetTime();
+
+    std::vector<std::unique_ptr<MergeSource>> src;
+    for (INode* n : list) {
+        src.push_back(std::make_unique<MergeSource>());
+        std::string err;
+        if (!read_source(n, t, *src.back(), err)) return fail(utf8(MSTR(n->GetName())) + ": " + err);
+        if (!src.back()->above.empty()) {
+            log += "  ! " + utf8(MSTR(n->GetName())) + ": not carried (above Skin):";
+            for (const std::string& m : src.back()->above) log += " " + m;
+            log += "\n";
+        }
+    }
+
+    // The bind pose: one per bone over all objects, and the first object's space. A bone's comes
+    // from the objects with weights on it, which must agree; an object that lists a bone without
+    // using it (FBX imports list the whole rig) may hold any matrix for it, and none of its
+    // vertices depend on it.
+    std::vector<MergeBone> bones;
+    std::map<INode*, size_t> boneAt;
+    for (int pass = 0; pass < 2; ++pass)
+        for (size_t i = 0; i < src.size(); ++i) {
+            MergeSource& s = *src[i];
+            std::set<INode*> used;
+            for (int v = 0; v < s.ctx->GetNumPoints(); ++v)
+                for (int k = 0; k < s.ctx->GetNumAssignedBones(v); ++k)
+                    if (s.ctx->GetBoneWeight(v, k) > 0) used.insert(s.skin->GetBone(s.ctx->GetAssignedBone(v, k)));
+            auto* s2 = static_cast<ISkin2*>(s.skinMod->GetInterface(I_SKIN2));
+            for (int b = 0; b < s.skin->GetNumBonesFlat(); ++b) {
+                INode* bone = s.skin->GetBoneFlat(b);
+                if (!bone || (pass == 0) != (used.count(bone) > 0)) continue;  // users first, then the rest
+                MergeBone mb{bone, Matrix3(), Matrix3(), Matrix3(), i};
+                mb.objectTm.IdentityMatrix();
+                mb.nodeTm.IdentityMatrix();
+                mb.stretchTm.IdentityMatrix();
+                s.skin->GetBoneInitTM(bone, mb.objectTm, true);
+                s.skin->GetBoneInitTM(bone, mb.nodeTm, false);
+                if (s2) mb.stretchTm = s2->GetBoneStretchTm(bone);
+                if (auto it = boneAt.find(bone); it != boneAt.end()) {
+                    if (pass == 0 && !close_tm(bones[it->second].objectTm, mb.objectTm))
+                        return fail(utf8(MSTR(bone->GetName())) + " has another bind pose in " + utf8(MSTR(s.node->GetName())) + " than in " +
+                                    utf8(MSTR(src[bones[it->second].from]->node->GetName())) + ": they cannot share one Skin");
+                    continue;
+                }
+                boneAt[bone] = bones.size();
+                bones.push_back(mb);
+            }
+        }
+    // The merged Skin lists the bones in the objects' order.
+    std::vector<MergeBone> ordered;
+    for (auto& s : src)
+        for (int b = 0; b < s->skin->GetNumBonesFlat(); ++b)
+            if (INode* bone = s->skin->GetBoneFlat(b); bone && boneAt.count(bone) &&
+                std::none_of(ordered.begin(), ordered.end(), [&](const MergeBone& m) { return m.node == bone; }))
+                ordered.push_back(bones[boneAt[bone]]);
+    bones = std::move(ordered);
+    Matrix3 baseObj, baseNode;
+    src[0]->skin->GetSkinInitTM(src[0]->node, baseObj, true);
+    src[0]->skin->GetSkinInitTM(src[0]->node, baseNode, false);
+    for (auto& s : src) {
+        Matrix3 tm;
+        s->skin->GetSkinInitTM(s->node, tm, true);
+        if (tm == baseObj) s->toMerged.IdentityMatrix();
+        else s->toMerged = tm * Inverse(baseObj);
+    }
+
+    std::vector<IdMap> ids;
+    Mtl* mtl = merged_material(src, ids);
+    auto mesh = std::make_unique<MNMesh>();
+    merge_meshes(src, ids, *mesh);
+    const std::vector<MergeChannel> channels = merge_channels(src, log);
+
+    theHold.Begin();
+    INode* first = src[0]->node;
+    PolyObject* obj = CreateEditablePolyObject();
+    obj->GetMesh() = *mesh;
+    INode* merged = GetCOREInterface()->CreateObjectNode(obj);
+    MSTR name = MSTR(first->GetName()) + _M("_merged");
+    if (GetCOREInterface()->GetINodeByName(name)) GetCOREInterface()->MakeNameUnique(name);
+    merged->SetName(name);
+    merged->SetNodeTM(t, first->GetNodeTM(t));
+    merged->SetObjOffsetPos(first->GetObjOffsetPos());
+    merged->SetObjOffsetRot(first->GetObjOffsetRot());
+    merged->SetObjOffsetScale(first->GetObjOffsetScale());
+    merged->SetWireColor(first->GetWireColor());
+    merged->SetMtl(mtl);
+    if (INode* parent = first->GetParentNode(); parent && !parent->IsRootNode()) parent->AttachChild(merged, 1);
+
+    // Morpher first: each channel is built against the merged bind shape, then Skin on top.
+    int built = 0;
+    if (!channels.empty()) {
+        auto* morph = static_cast<Modifier*>(CreateInstance(OSM_CLASS_ID, MR3_CLASS_ID));
+        if (!morph || GetCOREInterface7()->AddModifier(*merged, *morph) != Interface7::kRES_SUCCESS) {
+            theHold.Cancel();
+            return fail("cannot add a Morpher");
+        }
+        merged->EvalWorldState(t);
+        for (size_t c = 0; c < channels.size(); ++c) built += build_channel(merged, 1, (int)c + 1, channels[c], src, *mesh, t, log);
+    }
+    auto* skinMod = static_cast<Modifier*>(CreateInstance(OSM_CLASS_ID, SKIN_CLASSID));
+    if (!skinMod || GetCOREInterface7()->AddModifier(*merged, *skinMod) != Interface7::kRES_SUCCESS) {
+        theHold.Cancel();
+        return fail("cannot add a Skin");
+    }
+    auto* import = static_cast<ISkinImportData*>(skinMod->GetInterface(I_SKINIMPORTDATA));
+    auto* skin2 = static_cast<ISkin2*>(skinMod->GetInterface(I_SKIN2));
+    for (const MergeBone& b : bones) import->AddBoneEx(b.node, FALSE);
+    merged->EvalWorldState(t);  // Skin makes its data for the node
+    import->SetSkinTm(merged, baseObj, baseNode);
+    for (const MergeBone& b : bones) {
+        import->SetBoneTm(b.node, b.objectTm, b.nodeTm);
+        if (skin2) skin2->SetBoneStretchTm(b.node, b.stretchTm);  // after SetBoneTm, which clears it
+    }
+    skinMod->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
+    merged->EvalWorldState(t);
+    auto* skin = static_cast<ISkin*>(skinMod->GetInterface(I_SKIN));
+    ISkinContextData* ctx = skin ? skin->GetContextInterface(merged) : nullptr;
+    if (!ctx || ctx->GetNumPoints() != mesh->VNum()) {
+        theHold.Cancel();
+        return fail("the new Skin does not have the merged vertices");
+    }
+    Tab<INode*> wb;
+    Tab<float> ww;
+    size_t unweighted = 0;
+    for (auto& s : src)
+        for (int v = 0; v < (int)s->vertex.size(); ++v) {
+            if (s->vertex[v] < 0) continue;
+            wb.SetCount(0);
+            ww.SetCount(0);
+            for (int k = 0; k < s->ctx->GetNumAssignedBones(v); ++k) {
+                INode* b = s->skin->GetBone(s->ctx->GetAssignedBone(v, k));
+                float w = s->ctx->GetBoneWeight(v, k);
+                if (!b) continue;
+                wb.Append(1, &b);
+                ww.Append(1, &w);
+            }
+            if (wb.Count()) import->AddWeights(merged, s->vertex[v], wb, ww);
+            else ++unweighted;
+        }
+    // Dual quaternion blending: on when any object has it, each vertex with its own blend weight
+    // (0, linear, for the vertices of an object without it).
+    const bool dq = std::any_of(src.begin(), src.end(), [](const auto& s) { return s->skin->GetDQBlending() != FALSE; });
+    skin->SetDQBlending(dq);
+    if (dq)
+        for (auto& s : src) {
+            const bool on = s->skin->GetDQBlending() != FALSE;
+            for (int v = 0; v < (int)s->vertex.size(); ++v)
+                if (s->vertex[v] >= 0) ctx->SetDQBlendWeight(s->vertex[v], on ? s->ctx->GetDQBlendWeight(v) : 0.0f);
+        }
+    skinMod->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
+
+    // Skin's bone limit (the largest of the objects'), the layer, the objects hidden.
+    std::wstring code = L"(local n = maxOps.getNodeByHandle " + std::to_wstring(merged->GetHandle()) + L"\nlocal src = #(";
+    for (size_t i = 0; i < src.size(); ++i) code += (i ? L", " : L"") + std::to_wstring(src[i]->node->GetHandle());
+    code += L")\nsrc = for h in src collect maxOps.getNodeByHandle h\nlocal skins = #(";
+    for (size_t i = 0; i < src.size(); ++i) code += (i ? L", " : L"") + std::to_wstring(src[i]->skinIndex);
+    code += L")\ntry (n.modifiers[1].bone_Limit = amax (for i = 1 to src.count collect src[i].modifiers[skins[i]].bone_Limit)) catch ()\n"
+            L"src[1].layer.addNode n\nhide src\nselect n)";
+    run_mxs(code);
+    theHold.Accept(_M("Merge skinned"));
+    merged->EvalWorldState(t);
+    mergedOut = merged;
+
+    char line[512];
+    std::snprintf(line, sizeof line, "merged %zu objects into %s: %d vertices, %d faces, %zu bones, %d of %zu morph channels\n", src.size(),
+                  utf8(merged->GetName()).c_str(), mesh->VNum(), mesh->FNum(), bones.size(), built, channels.size());
+    std::string report = line;
+    if (unweighted) report += "  ! " + std::to_string(unweighted) + " vertices had no weights (Skin gives them envelope weights)\n";
+    if (mtl && mtl->IsMultiMtl() && mtl != first->GetMtl()) report += "  materials combined in " + utf8(mtl->GetName()) + "\n";
+    report += log;
+    report += "the objects are hidden; delete them when the merged one is right\n";
+    out.write(out.ctx, report.data(), report.size());
+    return true;
+}
+
 const ExodusCoreApi kApi{kExodusCoreApiVersion, kBuild, inspect, unsubdivide_modify, decimate_modify, write_weights,
-                       pack_modify, pack_bake, pack_forget};
+                       pack_modify, pack_bake, pack_forget, merge};
 
 }  // namespace
 

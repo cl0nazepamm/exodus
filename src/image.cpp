@@ -2,6 +2,8 @@
 #include "image.h"
 #include "exodus.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -98,6 +100,53 @@ Image downsample2(const Image& src) {
                 d.set((size_t)y * d.w + x, ch, (s + 2) / 4);
             }
         }
+    return d;
+}
+
+// The source samples behind each of `m` output samples along an axis of `n`, with their weights:
+// the two nearest sample centres when enlarging, the area each source sample covers when shrinking.
+static std::vector<std::vector<std::pair<int, float>>> axis_taps(int n, int m) {
+    std::vector<std::vector<std::pair<int, float>>> taps(m);
+    const double s = (double)n / m;
+    for (int o = 0; o < m; ++o) {
+        auto& t = taps[o];
+        if (s <= 1) {
+            const double x = (o + 0.5) * s - 0.5;
+            const int i = (int)std::floor(x);
+            const double f = x - i;
+            t.push_back({std::clamp(i, 0, n - 1), (float)(1 - f)});
+            t.push_back({std::clamp(i + 1, 0, n - 1), (float)f});
+        } else {
+            const double x0 = o * s, x1 = (o + 1) * s;
+            for (int i = (int)std::floor(x0); i < n && i < x1; ++i) {
+                const double w = std::min(x1, i + 1.0) - std::max(x0, (double)i);
+                if (w > 0) t.push_back({i, (float)(w / s)});
+            }
+        }
+    }
+    return taps;
+}
+
+Image resample(const Image& src, int w, int h) {
+    const auto tx = axis_taps(src.w, w), ty = axis_taps(src.h, h);
+    std::vector<float> rows((size_t)w * src.h * src.c);  // resampled across, not yet down
+    for (int y = 0; y < src.h; ++y)
+        for (int x = 0; x < w; ++x)
+            for (int ch = 0; ch < src.c; ++ch) {
+                float v = 0;
+                for (auto [i, wt] : tx[x]) v += wt * (float)src.get((size_t)y * src.w + i, ch);
+                rows[((size_t)y * w + x) * src.c + ch] = v;
+            }
+    Image d;
+    d.alloc(w, h, src.c, src.bps);
+    const long maxv = (long)src.maxv();
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            for (int ch = 0; ch < src.c; ++ch) {
+                float v = 0;
+                for (auto [i, wt] : ty[y]) v += wt * rows[((size_t)i * w + x) * src.c + ch];
+                d.set((size_t)y * w + x, ch, (uint32_t)std::clamp(std::lround(v), 0L, maxv));
+            }
     return d;
 }
 

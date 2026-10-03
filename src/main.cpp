@@ -57,6 +57,8 @@ static void usage() {
         "                                alone it decimates as far as E allows\n"
         "  --no-decimate <material-glob> leave a material at full detail (budget still counts it)\n"
         "  --lock-border                 keep open mesh borders fixed while decimating\n"
+        "  --symmetric-decimate          decimate mirror-symmetric meshes symmetrically (one half is\n"
+        "                                simplified, the other rebuilt as its mirror image)\n"
         "  --normal-weight W             decimation weight of normals (default 0.5)\n"
         "  --uv-weight W                 decimation weight of UVs (default 1/sqrt(mean UV triangle area))\n"
         "  --uvset <name>                UV set to pack (default: first)\n"
@@ -116,6 +118,7 @@ static bool parse_args(int argc, char** argv, PackOptions& o) {
         }
         else if (a == "--max-error") o.maxError = std::stod(next());
         else if (a == "--lock-border") o.lockBorder = true;
+        else if (a == "--symmetric-decimate") o.symmetricDecimate = true;
         else if (a == "--no-decimate") o.noDecimate.push_back(next());
         else if (a == "--normal-weight") o.normalWeight = std::stod(next());
         else if (a == "--uv-weight") o.uvWeight = std::stod(next());

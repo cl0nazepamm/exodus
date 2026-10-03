@@ -28,8 +28,10 @@ struct ExodusUnsubdivide {
 };
 
 struct ExodusDecimate {
-    float percent = 50;       // triangles to keep, % of the input's triangulation
-    bool lockBorder = false;  // keep open borders as they are
+    float percent = 50;          // triangles to keep, % of the input's triangulation
+    bool lockBorder = false;     // keep open borders as they are
+    bool symmetry = true;        // a mirror-symmetric mesh stays symmetric (see decimate.h)
+    bool lockSmoothing = false;  // keep edges between polygons that share no smoothing group
 };
 
 using ExodusPos = std::array<float, 3>;  // a vertex position, compared bit for bit
@@ -71,13 +73,16 @@ struct ExodusReduceState {
 
 using ExodusIsReducer = bool (*)(Modifier*);
 
-// UDIM Pack: the maps are given per tile by hand (no guessing from materials). Tiles with at
-// least one map are packed into one atlas; faces in other tiles keep their UVs.
+// UDIM Pack: the maps are given per tile by hand (no guessing from materials), for all objects
+// or for one object. Tiles with at least one map are packed into one atlas; faces in other tiles
+// keep their UVs. An object with maps of its own in a tile uses only those there, so objects that
+// each start at 1001 pack side by side.
 constexpr int kExodusPackChannels = 6;
 
 struct ExodusPackMap {
-    int tile = 1001;     // UDIM number
-    int channel = 0;     // 0 .. kExodusPackChannels - 1
+    std::wstring object;  // node name; empty = all objects
+    int tile = 1001;      // UDIM number
+    int channel = 0;      // 0 .. kExodusPackChannels - 1
     std::wstring file;
 };
 
@@ -90,12 +95,16 @@ struct ExodusPackSettings {
     std::wstring channel[kExodusPackChannels];   // names (atlas file suffix); empty = unused
     int kind[kExodusPackChannels] = {};          // 0 color, 1 normal map OpenGL (Y+), 2 normal map DirectX (Y-)
     std::vector<ExodusPackMap> maps;
+    // Objects whose stack was collapsed with the modifier: their packed UVs are baked in, so they
+    // stay in the layout (read from their base object) and the others keep their places.
+    std::vector<std::wstring> collapsed;
     std::wstring outDir, prefix;               // where Bake writes; outDir empty = <scene folder>\exodus
 };
 
 struct ExodusPackTile {
+    std::wstring object;  // node name
     int tile = 1001;
-    int faces = 0;  // faces of all parts in this tile (source UVs)
+    int faces = 0;        // the object's faces in this tile (source UVs)
 };
 
 struct ExodusCoreApi {
@@ -123,7 +132,7 @@ struct ExodusCoreApi {
     // UDIM Pack's ModifyObject. One modifier instance is shared by all parts of a character, so
     // the layout is made from every node the modifier sits on (the others are evaluated below the
     // modifier when their input is not known yet) and kept in the core per modifier. Writes the
-    // packed UVs of this node into the target channel; `tiles` gets the UDIM tiles in use. Returns
+    // packed UVs of this node into the target channel; `tiles` gets the UDIM tiles in use per object. Returns
     // true when the layout changed, so the other nodes need to evaluate again.
     bool (*pack_modify)(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, const ExodusPackSettings& settings,
                         std::wstring& status, std::vector<ExodusPackTile>& tiles);
@@ -132,9 +141,15 @@ struct ExodusCoreApi {
     // whole report.
     bool (*pack_bake)(Modifier* self, const ExodusPackSettings& settings, ExodusSink log, std::wstring& status, bool& relayout);
     void (*pack_forget)(Modifier* self);  // the modifier is gone: drop its layout
+
+    // Merges skinned objects into a new one, as one undo step: their meshes at the input of Skin
+    // with the morphs off (the bind shape), one Skin with every bone at the bind pose they were
+    // skinned with and every vertex's own weights, one Morpher with every channel. The objects are
+    // hidden. `log` gets the report, `merged` the new node (null when nothing was made).
+    bool (*merge)(const std::vector<INode*>& nodes, ExodusSink log, INode*& merged);
 };
 
-constexpr int kExodusCoreApiVersion = 7;
+constexpr int kExodusCoreApiVersion = 11;
 
 // The one export of exodus_maxcore.dll.
 extern "C" typedef const ExodusCoreApi* (*ExodusCoreApiFn)();

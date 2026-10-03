@@ -41,3 +41,4 @@ void promote_pixel(const Image& src, size_t px, int dstC, int dstBps, uint32_t o
 
 Image downsample2(const Image& src);                  // 2x2 box filter, dims must be even
 Image upscale_nearest(const Image& src, int fx, int fy);  // integer replication
+Image resample(const Image& src, int w, int h);       // any size: linear when enlarging, area when shrinking

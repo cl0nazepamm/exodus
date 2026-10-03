@@ -4,6 +4,11 @@
 // and exodus.reload() picks up the new one without a restart.
 #include <gup.h>
 #include <ifnpub.h>
+#pragma warning(push)
+#pragma warning(disable : 4535)  // the SDK's MAXScript headers call _set_se_translator, which wants /EHa
+#include <maxscript/maxscript.h>
+#pragma warning(pop)
+#include <notify.h>
 #include <Util/MainThreadTaskManager.h>
 
 #include <filesystem>
@@ -100,7 +105,7 @@ MSTR json_error(const MSTR& what) { return MSTR(_M("{\"error\": \"")) + what + _
 class ExodusInterface : public FPStaticInterface {
 public:
     DECLARE_DESCRIPTOR(ExodusInterface)
-    enum { kVersion, kReload, kInspect, kSync, kBake };
+    enum { kVersion, kReload, kInspect, kSync, kBake, kMerge };
 
     BEGIN_FUNCTION_MAP
     FN_0(kVersion, TYPE_TSTR_BV, Version)
@@ -108,10 +113,24 @@ public:
     FN_1(kInspect, TYPE_TSTR_BV, Inspect, TYPE_INODE)
     VFN_0(kSync, Sync)
     FN_1(kBake, TYPE_TSTR_BV, Bake, TYPE_REFTARG)
+    FN_1(kMerge, TYPE_TSTR_BV, Merge, TYPE_INODE_TAB_BR)
     END_FUNCTION_MAP
 
     // Bake of a UDIM Pack modifier, as its button does; returns the report.
     MSTR Bake(ReferenceTarget* modifier) { return pack_bake(modifier); }
+
+    // Merges skinned objects into a new one, keeping Skin weights and morphs; returns the report.
+    MSTR Merge(Tab<INode*>& nodes) {
+        const ExodusCoreApi* api = exodus_core();
+        if (!api) return exodus_core_error();
+        std::vector<INode*> list(nodes.Addr(0), nodes.Addr(0) + nodes.Count());
+        INode* merged = nullptr;
+        HCURSOR cursor = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+        MSTR report = collect([&](ExodusSink sink) { api->merge(list, sink, merged); });
+        SetCursor(cursor);
+        GetCOREInterface()->RedrawViews(GetCOREInterface()->GetTime());
+        return report;
+    }
 
     // Runs the work the modifiers left for after the evaluation (Skin weight updates) right now,
     // for scripts that change a modifier and read Skin in the same go.
@@ -151,13 +170,34 @@ ExodusInterface theInterface(kInterfaceId, _M("exodus"), 0, nullptr, FP_CORE,
     ExodusInterface::kSync, _M("sync"), 0, TYPE_VOID, 0, 0,
     ExodusInterface::kBake, _M("bake"), 0, TYPE_TSTR_BV, 0, 1,
         _M("modifier"), 0, TYPE_REFTARG,
+    ExodusInterface::kMerge, _M("merge"), 0, TYPE_TSTR_BV, 0, 1,
+        _M("nodes"), 0, TYPE_INODE_TAB_BR,
     p_end);
 // clang-format on
 
-// A global utility plugin whose only job is to keep this DLL loaded from startup on.
+// The Merge Skinned action (Customize User Interface, category Exodus), defined once Max runs
+// (a task posted from startup runs after MAXScript is up, whatever order startup notifies in).
+// The Merge Skinned action (Customize User Interface, category Exodus), defined once Max runs. The
+// definition is the plugin's own text, not scene content: as Dynamic (or unspecified) source, Safe
+// Scene Script Execution blocks macroScript definitions.
+class RegisterMacros : public MainThreadTask {
+public:
+    void Execute() override {
+        ExecuteMAXScriptScript(
+            _M("macroScript MergeSkinned category:\"Exodus\" buttonText:\"Merge Skinned\" ")
+            _M("tooltip:\"Merge the selected skinned objects into one, keeping Skin weights and morphs\" (\n")
+            _M("    on execute do (local r = exodus.merge (selection as array); format \"%\\n\" r; messageBox r title:\"Exodus: Merge Skinned\")\n)"),
+            MAXScript::ScriptSource::NonEmbedded, TRUE);
+    }
+};
+
+// A global utility plugin: keeps this DLL loaded from startup on and registers the actions.
 class ExodusGup : public GUP {
 public:
-    DWORD Start() override { return GUPRESULT_KEEP; }
+    DWORD Start() override {
+        IMainThreadTaskManager::GetInstance()->PostTask(new RegisterMacros);
+        return GUPRESULT_KEEP;
+    }
     void Stop() override { core.unload(); }
     void DeleteThis() override { delete this; }
 };
