@@ -21,6 +21,7 @@ void reduce_refresh_all();  // after the core DLL was reloaded: recompute every 
 
 ClassDesc2* pack_desc();
 void pack_refresh_all();                  // after the core DLL was reloaded: lay out again
-MSTR pack_bake(ReferenceTarget* target);  // Bake of a UDIM Pack modifier; returns its report
-MSTR pack_preview(ReferenceTarget* target);  // Preview of a UDIM Pack modifier (opens its window); returns its report
-MSTR pack_detect(ReferenceTarget* target);   // Auto detect of a UDIM Pack modifier (maps from materials); returns its report
+MSTR pack_bake(ReferenceTarget* target);  // Bake of a Material Combine modifier; returns its report
+MSTR pack_preview(ReferenceTarget* target);  // Preview of a Material Combine modifier (opens its window); returns its report
+MSTR pack_detect(ReferenceTarget* target);   // Auto detect of a Material Combine modifier (maps from materials); returns its report
+MSTR pack_paint(ReferenceTarget* target, int kind);  // ID map (0) or flat albedo (1) of a Material Combine modifier; returns its report

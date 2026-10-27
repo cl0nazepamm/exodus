@@ -184,10 +184,10 @@ static Vec2d nearest_on_tri(const Vec2d& p, const Vec2d& a, const Vec2d& b, cons
 }
 
 // Bilinear sample of `im` at the continuous pixel position (x, y) (pixel i spans i .. i + 1); added
-// to `acc` at the atlas channel's count and depth. Inside the map the taps stop at its border; a
-// position outside it (UVs that tile) repeats the map, as on the model.
-static void sample_bilinear(const Image& im, double x, double y, int c, int bps, double acc[4]) {
-    const bool inX = x >= 0 && x <= im.w, inY = y >= 0 && y <= im.h;
+// to `acc` at the atlas channel's count and depth. The map repeats, as on the model; a face that
+// stays inside it (`repeat` false) has its taps stop at the map's border instead.
+static void sample_bilinear(const Image& im, double x, double y, int c, int bps, bool repeat, double acc[4]) {
+    const bool inX = !repeat && x >= 0 && x <= im.w, inY = !repeat && y >= 0 && y <= im.h;
     x -= 0.5;
     y -= 0.5;
     const int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
@@ -941,6 +941,7 @@ bool Packer::compose_layout(std::vector<uint8_t>& owned, BleedPlan& plan, std::v
         int n = 1;             // n x n samples per atlas pixel
         double turn[4] = {1, 0, 0, 1};
         bool turned = false;
+        bool repeat = false;   // its source UVs leave their tile: the map repeats across the face
     };
     std::vector<LayoutTri> tris;
     size_t flat = 0;
@@ -960,6 +961,8 @@ bool Packer::compose_layout(std::vector<uint8_t>& owned, BleedPlan& plan, std::v
                 lay[k] = layoutUv[mi][c];
                 sp[k] = src_px(sources[sid], uv[k], tile);
                 t.dst[k] = {lay[k].x * AW, (1.0 - lay[k].y) * AH};
+                const double lu = uv[k].x - tile.u, lv = uv[k].y - tile.v;
+                t.repeat |= lu < -1e-6 || lu > 1 + 1e-6 || lv < -1e-6 || lv > 1 + 1e-6;
             }
             const Vec2d d1{t.dst[1].x - t.dst[0].x, t.dst[1].y - t.dst[0].y}, d2{t.dst[2].x - t.dst[0].x, t.dst[2].y - t.dst[0].y};
             const Vec2d s1{sp[1].x - sp[0].x, sp[1].y - sp[0].y}, s2{sp[2].x - sp[0].x, sp[2].y - sp[0].y};
@@ -1063,7 +1066,8 @@ bool Packer::compose_layout(std::vector<uint8_t>& owned, BleedPlan& plan, std::v
                             for (int sx = 0; sx < t.n; ++sx) {
                                 const Vec2d p = nearest_on_tri({x + (sx + 0.5) / t.n, y + (sy + 0.5) / t.n}, t.dst[0], t.dst[1], t.dst[2]);
                                 const double px = p.x - t.dst[0].x, py = p.y - t.dst[0].y;
-                                sample_bilinear(im, t.src0.x + t.m[0] * px + t.m[1] * py, t.src0.y + t.m[2] * px + t.m[3] * py, ch.c, ch.bps, v);
+                                sample_bilinear(im, t.src0.x + t.m[0] * px + t.m[1] * py, t.src0.y + t.m[2] * px + t.m[3] * py, ch.c, ch.bps,
+                                                t.repeat, v);
                             }
                         for (int k = 0; k < ch.c; ++k) v[k] /= (double)t.n * t.n;
                         if (t.turned && ch.kind != KIND_COLOR && ch.c >= 2) turn_normal(ch.kind, t.turn, v, maxv);
@@ -1093,6 +1097,43 @@ bool Packer::compose_layout(std::vector<uint8_t>& owned, BleedPlan& plan, std::v
             bleedMs, saveMs);
     }
     return true;
+}
+
+bool paint_flat(const std::vector<FlatTri>& tris, int w, int h, bool blend, const std::string& file, std::string& err) {
+    Image img;
+    img.alloc(w, h, 3, 1);
+    std::vector<uint8_t> owned((size_t)w * h, 0);  // 1 a triangle holds the centre, 2 one touches it
+    for (int pass = 0; pass < 2; ++pass)
+        for (const FlatTri& t : tris) {
+            Vec2d p[3];
+            for (int k = 0; k < 3; ++k) p[k] = {t.uv[k].x * w, (1.0 - t.uv[k].y) * h};
+            auto put = [&](int x, int y) {
+                uint8_t& m = owned[(size_t)y * w + x];
+                if (pass == 1 && m) return;  // edge pixels: only where nothing is yet
+                m = pass ? 2 : 1;
+                for (int c = 0; c < 3; ++c) img.set((size_t)y * w + x, c, t.rgb[c]);
+            };
+            if (pass == 0) raster_centers(p, w, h, put);
+            else raster_tri(p, w, h, put);
+        }
+    const BleedPlan plan = make_bleed_plan(owned, w, h);
+    if (blend) {
+        apply_bleed(img, plan, false);
+    } else {
+        static constexpr int dx[8] = {-1, 0, 1, -1, 1, -1, 0, 1}, dy[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
+        for (uint32_t i : plan.order) {
+            const int x = (int)(i % w), y = (int)(i / w);
+            for (int k = 0; k < 8; ++k) {
+                const int nx = x + dx[k], ny = y + dy[k];
+                if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+                const size_t j = (size_t)ny * w + nx;
+                if (plan.ring[j] >= plan.ring[i]) continue;
+                for (int c = 0; c < 3; ++c) img.set(i, c, img.get(j, c));
+                break;
+            }
+        }
+    }
+    return save_png(file, img, err);
 }
 
 // ---- 5. side outputs ----------------------------------------------------------------------

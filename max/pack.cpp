@@ -1,14 +1,17 @@
-// Exodus for 3ds Max: the UDIM Pack modifier. One instance goes on every part of a character
-// (select them all, add the modifier once). The maps are given by hand per UDIM tile, for all
-// objects or for one object: pick an object (or all), a tile in the list, a file for each channel.
-// An object's own maps in a tile replace the ones for all objects there, so objects that each use
-// tile 1001 with their own textures pack side by side. Tiles with maps go into one atlas, the packed
-// UVs go into the target map channel, Preview shows the layout in a window of its own and Bake
-// writes the atlas maps. Auto detect fills every object's maps from its material (by slot name);
-// they stay editable by hand. With Keep target UV layout the target channel already holds the layout
-// (a clean pack of the objects made by hand): nothing is packed and Bake resamples the maps into
-// it. The layout lives in the core DLL (see maxcore.cpp); this part holds the parameters, the
-// rollout and the preview window.
+// Exodus for 3ds Max: the Material Combine modifier (was UDIM Pack; class ID and the exodusPack
+// script name are unchanged). One instance goes on every object to combine (select them all, add
+// the modifier once); Bake writes one atlas per channel for all of them. Auto detect fills every
+// object's maps from its material (by slot name); they stay editable by hand: pick an object (or
+// all), a tile in the list, a file for each channel. An object's own maps in a tile replace the
+// ones for all objects there. Preview shows the layout in a window of its own.
+// Two layouts. Keep target UV layout (the default for new modifiers): the target channel already
+// holds a clean pack of the objects, nothing is packed and Bake resamples the maps into it, tiled
+// maps repeating. Off: the modifier packs the tiles with maps itself and writes the packed UVs into
+// the target channel; that is for figures whose parts sit in UDIM tiles (DAZ: legs, arms, torso).
+// ID map and Flat albedo paint the materials (one color each, or their base color) straight into
+// the kept layout, no textures needed; ID by connection colors each connected piece instead.
+// The layout lives in the core DLL (see maxcore.cpp); this part holds the parameters, the rollout
+// and the preview window.
 #include <iparamm2.h>
 #include <modstack.h>
 #include <notify.h>
@@ -33,6 +36,7 @@ enum { kParams };
 enum : ParamID {
     kSourceChannel = 0, kTargetChannel = 1, kSize = 2, kMaxSize = 3, kPadding = 4, kRotate = 5, kOutDir = 6, kPrefix = 7,
     kKeepLayout = 8,  // the target channel already holds the layout: no packing, the maps are resampled into it
+    kIdByConnection = 9,  // ID map: a color per connected piece of each object instead of per material
     kChannel1 = 10,  // .. 15: channel names
     kKind1 = 20,     // .. 25: channel types
     // One row per map: tile, channel (1-based), file and object (node name, empty = all objects;
@@ -86,11 +90,13 @@ public:
 
     ExodusPackSettings Settings(TimeValue t, Interval& valid) {
         ExodusPackSettings s;
-        BOOL rotate = TRUE, keep = FALSE;
+        BOOL rotate = TRUE, keep = FALSE, byConnection = FALSE;
         pblock->GetValue(kSourceChannel, t, s.sourceChannel, valid);
         pblock->GetValue(kTargetChannel, t, s.targetChannel, valid);
         pblock->GetValue(kKeepLayout, t, keep, valid);
         s.keepLayout = keep != FALSE;
+        pblock->GetValue(kIdByConnection, t, byConnection, valid);
+        s.idByConnection = byConnection != FALSE;
         pblock->GetValue(kSize, t, s.size, valid);
         pblock->GetValue(kMaxSize, t, s.maxSize, valid);
         pblock->GetValue(kPadding, t, s.padding, valid);
@@ -242,6 +248,25 @@ public:
         return report.c_str();
     }
 
+    // ID map (kind 0) or flat albedo (1) into the target channel's layout, from the materials.
+    // Returns the report.
+    MSTR Paint(int kind) {
+        const ExodusCoreApi* core = exodus_core();
+        if (!core) return status = exodus_core_error();
+        detectNote.clear();
+        Interval valid = FOREVER;
+        const ExodusPackSettings s = Settings(GetCOREInterface()->GetTime(), valid);
+        std::string log;
+        ExodusSink sink{[](void* ctx, const char* text, size_t n) { static_cast<std::string*>(ctx)->append(text, n); }, &log};
+        std::wstring text;
+        HCURSOR cursor = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+        core->pack_paint(this, s, kind, sink, text);
+        SetCursor(cursor);
+        status = text.c_str();
+        UpdateUI();
+        return MSTR::FromUTF8(log.c_str());
+    }
+
     // Bake: the atlas maps into the output folder. Returns the packer's report.
     MSTR Bake() {
         const ExodusCoreApi* core = exodus_core();
@@ -302,7 +327,7 @@ public:
 
     // Animatable
     void DeleteThis() override { delete this; }
-    void GetClassName(MSTR& s, bool localized) const override { s = localized ? exodus_string(IDS_UDIMPACK) : _M("UDIM Pack"); }
+    void GetClassName(MSTR& s, bool localized) const override { s = localized ? exodus_string(IDS_MATERIAL_COMBINE) : _M("Material Combine"); }
     Class_ID ClassID() override { return kPackClassId; }
     int NumSubs() override { return 1; }
     Animatable* SubAnim(int) override { return pblock; }
@@ -332,7 +357,7 @@ protected:
 
 public:
     // BaseObject / Modifier
-    const MCHAR* GetObjectName(bool localized) const override { return localized ? exodus_string(IDS_UDIMPACK) : _M("UDIM Pack"); }
+    const MCHAR* GetObjectName(bool localized) const override { return localized ? exodus_string(IDS_MATERIAL_COMBINE) : _M("Material Combine"); }
     CreateMouseCallBack* GetCreateMouseCallBack() override { return nullptr; }
     BOOL ChangeTopology() override { return FALSE; }
     ChannelMask ChannelsUsed() override { return TOPO_CHANNEL | TEXMAP_CHANNEL; }
@@ -390,7 +415,7 @@ void post_refresh(PackMod* mod) {
 }
 
 // The preview window: a plain window of the plugin's own (so it outlives a core reload) showing the
-// last Preview of any UDIM Pack modifier: the atlas, the packed faces' edges in one color per object.
+// last Preview of any Material Combine modifier: the atlas, the packed faces' edges in one color per object.
 // The wheel zooms at the cursor, a drag pans, a double click fits the atlas to the window again.
 class PreviewWindow {
 public:
@@ -450,7 +475,7 @@ void PreviewWindow::Show(ExodusPackPreview&& preview, bool open) {
         if (!hwnd) return;
         fitted = true;
     }
-    std::wstring title = L"UDIM Pack preview";
+    std::wstring title = L"Material Combine preview";
     if (data.width) title += L": " + data.report.substr(0, data.report.find(L'\n'));
     SetWindowTextW(hwnd, title.c_str());
     if (fitted) Fit();
@@ -809,6 +834,10 @@ public:
                 mod->Detect();
                 return TRUE;
             }
+            if (id == IDC_ID_MAP || id == IDC_ALBEDO) {
+                mod->Paint(id == IDC_ID_MAP ? 0 : 1);
+                return TRUE;
+            }
             if (id == IDC_PREVIEW) {
                 mod->Preview();
                 return TRUE;
@@ -828,9 +857,19 @@ public:
 class PackClassDesc : public ClassDesc2 {
 public:
     int IsPublic() override { return TRUE; }
-    void* Create(BOOL) override { return new PackMod; }
-    const MCHAR* ClassName() override { return exodus_string(IDS_UDIMPACK); }
-    const MCHAR* NonLocalizedClassName() override { return _M("UDIM Pack"); }
+    // A new modifier keeps the target layout (combining separate objects). One loaded from a scene
+    // keeps what it was saved with: scenes from before keepLayout existed load as packing, as saved.
+    void* Create(BOOL loading) override {
+        auto* mod = new PackMod;
+        if (!loading) {
+            theHold.Suspend();
+            mod->pblock->SetValue(kKeepLayout, 0, TRUE);
+            theHold.Resume();
+        }
+        return mod;
+    }
+    const MCHAR* ClassName() override { return exodus_string(IDS_MATERIAL_COMBINE); }
+    const MCHAR* NonLocalizedClassName() override { return _M("Material Combine"); }
     SClass_ID SuperClassID() override { return OSM_CLASS_ID; }
     Class_ID ClassID() override { return kPackClassId; }
     const MCHAR* Category() override { return exodus_string(IDS_CATEGORY); }
@@ -852,7 +891,7 @@ public:
 
 // clang-format off
 ParamBlockDesc2 packPbDesc(kParams, _M("parameters"), IDS_PARAMETERS, &packDesc, P_AUTO_CONSTRUCT + P_AUTO_UI, 0,
-    IDD_UDIMPACK, IDS_PARAMETERS, 0, 0, &packDlgProc,
+    IDD_MATERIAL_COMBINE, IDS_PARAMETERS, 0, 0, &packDlgProc,
     kSourceChannel, _M("sourceChannel"), TYPE_INT, 0, IDS_SOURCE_CHANNEL,
         p_default, 1,
         p_range, 1, 99,
@@ -863,9 +902,13 @@ ParamBlockDesc2 packPbDesc(kParams, _M("parameters"), IDS_PARAMETERS, &packDesc,
         p_range, 1, 99,
         p_ui, TYPE_SPINNER, EDITTYPE_INT, IDC_TARGET_EDIT, IDC_TARGET_SPIN, 1.0f,
         p_end,
-    kKeepLayout, _M("keepLayout"), TYPE_BOOL, 0, IDS_KEEP_LAYOUT,
+    kKeepLayout, _M("keepLayout"), TYPE_BOOL, P_RESET_DEFAULT, IDS_KEEP_LAYOUT,  // not sticky: an old scene without it loads as packing
         p_default, FALSE,
         p_ui, TYPE_SINGLECHECKBOX, IDC_KEEP_LAYOUT,
+        p_end,
+    kIdByConnection, _M("idByConnection"), TYPE_BOOL, P_RESET_DEFAULT, IDS_ID_BY_CONNECTION,
+        p_default, FALSE,
+        p_ui, TYPE_SINGLECHECKBOX, IDC_ID_BY_CONNECTION,
         p_end,
     kSize, _M("size"), TYPE_INT, 0, IDS_SIZE,
         p_default, 0,
@@ -942,20 +985,27 @@ void pack_refresh_all() {
 
 MSTR pack_bake(ReferenceTarget* target) {
     auto* mod = dynamic_cast<PackMod*>(target);
-    if (!mod || !packInstances.count(mod)) return _M("not a UDIM Pack modifier");
+    if (!mod || !packInstances.count(mod)) return _M("not a Material Combine modifier");
     MSTR log = mod->Bake();
+    return log + _M("\n") + mod->status;
+}
+
+MSTR pack_paint(ReferenceTarget* target, int kind) {
+    auto* mod = dynamic_cast<PackMod*>(target);
+    if (!mod || !packInstances.count(mod)) return _M("not a Material Combine modifier");
+    MSTR log = mod->Paint(kind);
     return log + _M("\n") + mod->status;
 }
 
 MSTR pack_detect(ReferenceTarget* target) {
     auto* mod = dynamic_cast<PackMod*>(target);
-    if (!mod || !packInstances.count(mod)) return _M("not a UDIM Pack modifier");
+    if (!mod || !packInstances.count(mod)) return _M("not a Material Combine modifier");
     return mod->Detect();
 }
 
 MSTR pack_preview(ReferenceTarget* target) {
     auto* mod = dynamic_cast<PackMod*>(target);
-    if (!mod || !packInstances.count(mod)) return _M("not a UDIM Pack modifier");
+    if (!mod || !packInstances.count(mod)) return _M("not a Material Combine modifier");
     MSTR log = mod->Preview();
     return log + _M("\n") + mod->status;
 }

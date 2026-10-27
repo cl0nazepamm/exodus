@@ -91,6 +91,17 @@ int udim_number(Tile t);
 bool parse_tiles(const std::string& text, std::vector<int>& tiles);
 bool glob_match(const std::string& pattern, const std::string& s);  // * and ?, case-insensitive
 
+// One triangle of a flat map (ID map, flat albedo): corners in layout UV (0 .. 1, v up), its color.
+struct FlatTri {
+    Vec2d uv[3];
+    uint8_t rgb[3];
+};
+
+// A w x h map of flat triangles into `file` (PNG): every pixel a triangle covers (its centre, else
+// touched along the edges) takes its color, the rest grows out of them. `blend` averages the grown
+// pixels (albedo); without it each copies one neighbour, so an ID map holds only its own colors.
+bool paint_flat(const std::vector<FlatTri>& tris, int w, int h, bool blend, const std::string& file, std::string& err);
+
 // Progress and warnings; printf-style. Goes to stdout unless a host sets `say_hook`.
 void say(const char* fmt, ...);
 inline void (*say_hook)(const char* text) = nullptr;

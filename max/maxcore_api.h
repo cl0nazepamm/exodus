@@ -73,10 +73,10 @@ struct ExodusReduceState {
 
 using ExodusIsReducer = bool (*)(Modifier*);
 
-// UDIM Pack: the maps are given per tile by hand (no guessing from materials), for all objects
-// or for one object. Tiles with at least one map are packed into one atlas; faces in other tiles
-// keep their UVs. An object with maps of its own in a tile uses only those there, so objects that
-// each start at 1001 pack side by side.
+// Material Combine (was UDIM Pack): the maps are given per tile, for all objects or for one object
+// (by hand, or filled from the materials by Auto detect). Tiles with at least one map go into one
+// atlas; faces in other tiles keep their UVs. An object with maps of its own in a tile uses only
+// those there, so objects that each start at 1001 combine side by side.
 constexpr int kExodusPackChannels = 6;
 
 struct ExodusPackMap {
@@ -91,6 +91,7 @@ struct ExodusPackSettings {
     // The target channel already holds a clean pack of all objects: it is the layout (no packing,
     // nothing written to the mesh) and Bake resamples each face's maps from the source UVs into it.
     bool keepLayout = false;
+    bool idByConnection = false;               // ID map: one color per connected piece of each object, not per material
     int size = 0;                              // atlas width and height; 0 = smallest that fits
     int maxSize = 8192;
     int padding = 8;
@@ -142,7 +143,7 @@ struct ExodusCoreApi {
     // a vertex this modifier's own copy does not have. Returns true when Skin was brought in step.
     bool (*write_weights)(INode* node, Modifier* self, ExodusReduceState& state, const std::vector<ExodusSkinCopy*>& below);
 
-    // UDIM Pack's ModifyObject. One modifier instance is shared by all parts of a character, so
+    // Material Combine's ModifyObject. One modifier instance is shared by all parts of a character, so
     // the layout is made from every node the modifier sits on (the others are evaluated below the
     // modifier when their input is not known yet) and kept in the core per modifier. Writes the
     // packed UVs of this node into the target channel; `tiles` gets the UDIM tiles in use per object. Returns
@@ -165,6 +166,12 @@ struct ExodusCoreApi {
     // rows: the rows of each object found replaced, the others kept. `report` says what was found.
     // Returns false when no object had maps.
     bool (*pack_detect)(Modifier* self, ExodusPackSettings& settings, std::wstring& report);
+    // Flat maps painted straight into the target channel's layout from the objects' materials, no
+    // textures needed (Keep target UV layout only): kind 0 an ID map, one color per material (per
+    // connected piece with idByConnection), with a legend (<prefix>_ID.png, <prefix>_ID_legend.txt);
+    // kind 1 each material's flat base color
+    // in sRGB (<prefix>_Albedo.png). Written to the output folder at the size Bake would use.
+    bool (*pack_paint)(Modifier* self, const ExodusPackSettings& settings, int kind, ExodusSink log, std::wstring& status);
     void (*pack_forget)(Modifier* self);  // the modifier is gone: drop its layout
 
     // Merges skinned objects into a new one, as one undo step: their meshes at the input of Skin
@@ -174,7 +181,7 @@ struct ExodusCoreApi {
     bool (*merge)(const std::vector<INode*>& nodes, ExodusSink log, INode*& merged);
 };
 
-constexpr int kExodusCoreApiVersion = 14;
+constexpr int kExodusCoreApiVersion = 16;
 
 // The one export of exodus_maxcore.dll.
 extern "C" typedef const ExodusCoreApi* (*ExodusCoreApiFn)();

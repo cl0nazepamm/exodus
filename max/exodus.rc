@@ -29,7 +29,7 @@ BEGIN
     LTEXT           "", IDC_STATUS, 6, 64, 96, 52
 END
 
-IDD_UDIMPACK DIALOGEX 0, 0, 108, 496
+IDD_MATERIAL_COMBINE DIALOGEX 0, 0, 108, 526
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "MS Sans Serif", 0, 0, 0x0
 BEGIN
@@ -92,9 +92,12 @@ BEGIN
     PUSHBUTTON      "...", IDC_OUT_DIR_BROWSE, 92, 386, 12, 11
     LTEXT           "Prefix:", -1, 4, 402, 28, 8
     CONTROL         "", IDC_PREFIX, "CustEdit", WS_TABSTOP, 34, 400, 70, 10
-    PUSHBUTTON      "Preview", IDC_PREVIEW, 4, 414, 48, 14
-    PUSHBUTTON      "Bake atlas", IDC_BAKE, 56, 414, 48, 14
-    LTEXT           "", IDC_STATUS, 4, 432, 100, 60
+    PUSHBUTTON      "ID map", IDC_ID_MAP, 4, 414, 48, 14
+    PUSHBUTTON      "Flat albedo", IDC_ALBEDO, 56, 414, 48, 14
+    CONTROL         "ID by connection", IDC_ID_BY_CONNECTION, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 4, 431, 100, 10
+    PUSHBUTTON      "Preview", IDC_PREVIEW, 4, 444, 48, 14
+    PUSHBUTTON      "Bake atlas", IDC_BAKE, 56, 444, 48, 14
+    LTEXT           "", IDC_STATUS, 4, 462, 100, 60
 END
 
 STRINGTABLE
@@ -107,7 +110,7 @@ BEGIN
     IDS_DECIMATE "Decimate"
     IDS_PERCENT "Keep %"
     IDS_LOCK_BORDER "Lock borders"
-    IDS_UDIMPACK "UDIM Pack"
+    IDS_MATERIAL_COMBINE "Material Combine"
     IDS_SOURCE_CHANNEL "Source UV channel"
     IDS_TARGET_CHANNEL "Target UV channel"
     IDS_SIZE "Size"
@@ -132,4 +135,5 @@ BEGIN
     IDS_COLLAPSED_OBJECTS "Collapsed objects"
     IDS_KEEP_LAYOUT "Keep target UV layout"
     IDS_AUTO_DETECT "Auto detect maps"
+    IDS_ID_BY_CONNECTION "ID by connection"
 END
