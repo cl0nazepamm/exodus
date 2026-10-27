@@ -3,8 +3,12 @@
 // objects or for one object: pick an object (or all), a tile in the list, a file for each channel.
 // An object's own maps in a tile replace the ones for all objects there, so objects that each use
 // tile 1001 with their own textures pack side by side. Tiles with maps go into one atlas, the packed
-// UVs go into the target map channel and Bake writes the atlas maps. The layout lives in the core
-// DLL (see maxcore.cpp); this part holds the parameters and the rollout.
+// UVs go into the target map channel, Preview shows the layout in a window of its own and Bake
+// writes the atlas maps. Auto detect fills every object's maps from its material (by slot name);
+// they stay editable by hand. With Keep target UV layout the target channel already holds the layout
+// (a clean pack of the objects made by hand): nothing is packed and Bake resamples the maps into
+// it. The layout lives in the core DLL (see maxcore.cpp); this part holds the parameters, the
+// rollout and the preview window.
 #include <iparamm2.h>
 #include <modstack.h>
 #include <notify.h>
@@ -13,6 +17,7 @@
 #include <commdlg.h>  // after windows.h (from the Max headers)
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <set>
 #include <string>
@@ -27,6 +32,7 @@ const Class_ID kPackClassId(0xdcdf3ee7, 0x9ad18e13);
 enum { kParams };
 enum : ParamID {
     kSourceChannel = 0, kTargetChannel = 1, kSize = 2, kMaxSize = 3, kPadding = 4, kRotate = 5, kOutDir = 6, kPrefix = 7,
+    kKeepLayout = 8,  // the target channel already holds the layout: no packing, the maps are resampled into it
     kChannel1 = 10,  // .. 15: channel names
     kKind1 = 20,     // .. 25: channel types
     // One row per map: tile, channel (1-based), file and object (node name, empty = all objects;
@@ -38,6 +44,7 @@ enum : ParamID {
 class PackMod;
 std::set<PackMod*> packInstances;
 void post_refresh(PackMod* mod);
+void show_preview(ExodusPackPreview&& preview, bool open);
 
 // The names of the objects the modifier is on, sorted (deleted ones, kept for undo, left out).
 std::vector<std::wstring> object_names(ReferenceTarget* mod) {
@@ -61,6 +68,7 @@ public:
     IParamBlock2* pblock = nullptr;
     MSTR status;
     std::vector<ExodusPackTile> tiles;  // from the last evaluation
+    std::wstring detectNote;          // what the last Auto detect found, shown under the status until Preview or Bake
     std::wstring selectedObject;      // object shown in the rollout's tile list; empty = all objects
     int selectedTile = 0;             // tile shown in the rollout's map rows
     std::vector<std::wstring> shownObjects, shownLines;  // the object and tile lists as shown
@@ -78,9 +86,11 @@ public:
 
     ExodusPackSettings Settings(TimeValue t, Interval& valid) {
         ExodusPackSettings s;
-        BOOL rotate = TRUE;
+        BOOL rotate = TRUE, keep = FALSE;
         pblock->GetValue(kSourceChannel, t, s.sourceChannel, valid);
         pblock->GetValue(kTargetChannel, t, s.targetChannel, valid);
+        pblock->GetValue(kKeepLayout, t, keep, valid);
+        s.keepLayout = keep != FALSE;
         pblock->GetValue(kSize, t, s.size, valid);
         pblock->GetValue(kMaxSize, t, s.maxSize, valid);
         pblock->GetValue(kPadding, t, s.padding, valid);
@@ -192,10 +202,51 @@ public:
         NotifyDependents(FOREVER, PART_TEXMAP, REFMSG_CHANGE);
     }
 
+    // Auto detect: every object's maps from its material, as one undo step (the channels it names
+    // and the rows of the objects it found maps for). Returns the whole report.
+    MSTR Detect() {
+        const ExodusCoreApi* core = exodus_core();
+        if (!core) return status = exodus_core_error();
+        Interval valid = FOREVER;
+        ExodusPackSettings s = Settings(GetCOREInterface()->GetTime(), valid);
+        std::wstring report;
+        HCURSOR cursor = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+        const bool found = core->pack_detect(this, s, report);
+        SetCursor(cursor);
+        if (found) {
+            theHold.Begin();
+            for (int c = 0; c < kExodusPackChannels; ++c) {
+                const MCHAR* name = pblock->GetStr(kChannel1 + c, 0);
+                if (s.channel[c] == (name ? name : L"")) continue;
+                pblock->SetValue(kChannel1 + c, 0, s.channel[c].c_str());
+                pblock->SetValue(kKind1 + c, 0, s.kind[c]);
+            }
+            for (ParamID id : {kMapObjects, kMapFiles, kMapChannels, kMapTiles})
+                if (pblock->Count(id) > 0) pblock->Delete(id, 0, pblock->Count(id));
+            for (const ExodusPackMap& m : s.maps) AppendMap(m.object, m.tile, m.channel, m.file);
+            theHold.Accept(exodus_string(IDS_AUTO_DETECT));
+        }
+        // In the panel: the summary and the first two problems.
+        detectNote.clear();
+        int notes = 0;
+        for (size_t from = 0; from < report.size() && notes < 3;) {
+            const size_t end = std::min(report.find(L'\n', from), report.size());
+            std::wstring line = report.substr(from, end - from);
+            from = end + 1;
+            if (notes && line.rfind(L"  ! ", 0) != 0) continue;
+            if (notes) line = line.substr(4);
+            detectNote += (notes++ ? L"\n" : L"") + line;
+        }
+        NotifyDependents(FOREVER, PART_TEXMAP, REFMSG_CHANGE);
+        UpdateUI();
+        return report.c_str();
+    }
+
     // Bake: the atlas maps into the output folder. Returns the packer's report.
     MSTR Bake() {
         const ExodusCoreApi* core = exodus_core();
         if (!core) return status = exodus_core_error();
+        detectNote.clear();
         Interval valid = FOREVER;
         const ExodusPackSettings s = Settings(GetCOREInterface()->GetTime(), valid);
         std::string log;
@@ -211,6 +262,29 @@ public:
         return MSTR::FromUTF8(log.c_str());
     }
 
+    // Preview: Bake's dry run. The layout as Bake would make it, shown in the preview window;
+    // nothing is written. Returns the packer's report.
+    MSTR Preview() {
+        const ExodusCoreApi* core = exodus_core();
+        if (!core) return status = exodus_core_error();
+        detectNote.clear();
+        Interval valid = FOREVER;
+        const ExodusPackSettings s = Settings(GetCOREInterface()->GetTime(), valid);
+        std::string log;
+        ExodusSink sink{[](void* ctx, const char* text, size_t n) { static_cast<std::string*>(ctx)->append(text, n); }, &log};
+        std::wstring text;
+        bool relayout = false;
+        ExodusPackPreview preview;
+        HCURSOR cursor = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+        const bool ok = core->pack_preview(this, s, sink, text, relayout, preview);
+        SetCursor(cursor);
+        status = text.c_str();
+        if (relayout) NotifyDependents(FOREVER, PART_TEXMAP, REFMSG_CHANGE);
+        show_preview(std::move(preview), ok);  // without a layout: an open window says why, none opens
+        UpdateUI();
+        return MSTR::FromUTF8(log.c_str());
+    }
+
     IParamMap2* Map() {
         IParamMap2* map = Desc().GetParamMap(&PbDesc());
         return map && map->GetParamBlock() == pblock && map->GetHWnd() ? map : nullptr;
@@ -218,6 +292,13 @@ public:
 
     // Refreshes the rollout (`hw` while it opens: Max registers the map only afterwards).
     void UpdateUI(HWND hw = nullptr);
+
+    // A kept layout is not packed: padding and rotation do not apply.
+    void EnablePacking(IParamMap2* map) {
+        const bool packs = !pblock->GetInt(kKeepLayout, 0);
+        map->Enable(kPadding, packs);
+        map->Enable(kRotate, packs);
+    }
 
     // Animatable
     void DeleteThis() override { delete this; }
@@ -308,6 +389,236 @@ void post_refresh(PackMod* mod) {
     IMainThreadTaskManager::GetInstance()->PostTask(new RefreshTask(mod));
 }
 
+// The preview window: a plain window of the plugin's own (so it outlives a core reload) showing the
+// last Preview of any UDIM Pack modifier: the atlas, the packed faces' edges in one color per object.
+// The wheel zooms at the cursor, a drag pans, a double click fits the atlas to the window again.
+class PreviewWindow {
+public:
+    void Show(ExodusPackPreview&& preview, bool open);
+
+private:
+    HWND hwnd = nullptr;
+    ExodusPackPreview data;
+    double scale = 1, x0 = 0, y0 = 0;  // atlas pixel (x, y) is drawn at (x0 + x * scale, y0 + y * scale)
+    bool fitted = true;                // the atlas follows the window's size until zoomed or panned
+    bool dragging = false;
+    POINT drag{};
+
+    void Fit();
+    void Paint(HDC target, const RECT& rc);
+    LRESULT Message(HWND hw, UINT msg, WPARAM wp, LPARAM lp);
+    static LRESULT CALLBACK Proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp);
+} previewWindow;
+
+void show_preview(ExodusPackPreview&& preview, bool open) { previewWindow.Show(std::move(preview), open); }
+
+POINT point_of(LPARAM lp) { return {(short)LOWORD(lp), (short)HIWORD(lp)}; }
+
+// Hues well apart for any number of objects (golden ratio steps).
+COLORREF object_color(size_t i) {
+    const double h = std::fmod(i * 0.618034, 1.0) * 6, s = 0.55;
+    const int k = std::min((int)h, 5);
+    const double f = h - k, p = 1 - s, q = 1 - s * f, t = 1 - s * (1 - f);
+    const double rgb[6][3] = {{1, t, p}, {q, 1, p}, {p, 1, t}, {p, q, 1}, {t, p, 1}, {1, p, q}};
+    return RGB((int)(rgb[k][0] * 255), (int)(rgb[k][1] * 255), (int)(rgb[k][2] * 255));
+}
+
+// Opens the window (open: only when it is not open yet), or shows `preview` in the open one. A new
+// atlas size is fitted to the window; at the same size the view stays, to compare.
+void PreviewWindow::Show(ExodusPackPreview&& preview, bool open) {
+    static const wchar_t kClass[] = L"ExodusPackPreview";
+    if (!hwnd && !open) return;
+    if (preview.width != data.width || preview.height != data.height) fitted = true;
+    data = std::move(preview);
+    if (!hwnd) {
+        static const bool registered = [] {
+            WNDCLASSEXW wc = {sizeof wc};
+            wc.style = CS_DBLCLKS;
+            wc.lpfnWndProc = Proc;
+            wc.hInstance = hInstance;
+            wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+            wc.lpszClassName = kClass;
+            return RegisterClassExW(&wc) != 0;
+        }();
+        (void)registered;
+        HWND owner = GetCOREInterface()->GetMAXHWnd();  // owned: stays above Max, minimizes with it
+        RECT r;
+        GetWindowRect(owner, &r);
+        const int side = MaxSDK::UIScaled(720);
+        CreateWindowExW(0, kClass, L"", WS_OVERLAPPEDWINDOW, (r.left + r.right - side) / 2, (r.top + r.bottom - side) / 2, side, side,
+                        owner, nullptr, hInstance, this);
+        if (!hwnd) return;
+        fitted = true;
+    }
+    std::wstring title = L"UDIM Pack preview";
+    if (data.width) title += L": " + data.report.substr(0, data.report.find(L'\n'));
+    SetWindowTextW(hwnd, title.c_str());
+    if (fitted) Fit();
+    InvalidateRect(hwnd, nullptr, FALSE);
+    ShowWindow(hwnd, IsIconic(hwnd) ? SW_RESTORE : SW_SHOW);
+}
+
+void PreviewWindow::Fit() {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    const double w = std::max(data.width, 1), h = std::max(data.height, 1), margin = MaxSDK::UIScaled(12);
+    scale = std::max(std::min((rc.right - 2 * margin) / w, (rc.bottom - 2 * margin) / h), 1e-6);
+    x0 = (rc.right - w * scale) / 2;
+    y0 = (rc.bottom - h * scale) / 2;
+}
+
+void PreviewWindow::Paint(HDC target, const RECT& rc) {
+    HDC dc = CreateCompatibleDC(target);  // drawn off screen, then copied: no flicker while zooming
+    HBITMAP bitmap = CreateCompatibleBitmap(target, std::max<LONG>(rc.right, 1), std::max<LONG>(rc.bottom, 1));
+    HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
+    auto fill = [&](const RECT& r, COLORREF c) {
+        SetBkColor(dc, c);
+        ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &r, nullptr, 0, nullptr);
+    };
+    fill(rc, RGB(45, 45, 45));
+
+    if (data.width > 0) {
+        const double w = data.width * scale, h = data.height * scale;
+        const RECT atlas = {(LONG)std::lround(x0), (LONG)std::lround(y0), (LONG)std::lround(x0 + w), (LONG)std::lround(y0 + h)};
+        fill(atlas, RGB(18, 18, 18));
+        HBRUSH frame = CreateSolidBrush(RGB(100, 100, 100));
+        FrameRect(dc, &atlas, frame);
+        DeleteObject(frame);
+        // One PolyPolyline per object, of the edges that reach into the window.
+        std::vector<POINT> points;
+        std::vector<DWORD> counts;
+        for (size_t o = 0; o + 1 < data.objectFirst.size(); ++o) {
+            points.clear();
+            for (uint32_t e = data.objectFirst[o]; e < data.objectFirst[o + 1]; ++e) {
+                const auto& [u0, v0, u1, v1] = data.edges[e];
+                const POINT a{(LONG)std::lround(x0 + u0 * w), (LONG)std::lround(y0 + (1 - v0) * h)};
+                const POINT b{(LONG)std::lround(x0 + u1 * w), (LONG)std::lround(y0 + (1 - v1) * h)};
+                if ((a.x < 0 && b.x < 0) || (a.y < 0 && b.y < 0) || (a.x >= rc.right && b.x >= rc.right) || (a.y >= rc.bottom && b.y >= rc.bottom))
+                    continue;
+                points.push_back(a);
+                points.push_back(b);
+            }
+            if (points.empty()) continue;
+            counts.assign(points.size() / 2, 2);
+            HPEN pen = CreatePen(PS_SOLID, 1, object_color(o));
+            HGDIOBJ oldPen = SelectObject(dc, pen);
+            PolyPolyline(dc, points.data(), counts.data(), (DWORD)counts.size());
+            SelectObject(dc, oldPen);
+            DeleteObject(pen);
+        }
+    }
+
+    // Top left: the report (all of it without a layout, its warnings with one), the objects in their
+    // colors as far as they fit. Bottom left: how to move the view.
+    HGDIOBJ oldFont = SelectObject(dc, GetCOREInterface()->GetAppHFont());
+    TEXTMETRICW tm;
+    GetTextMetricsW(dc, &tm);
+    const int pad = MaxSDK::UIScaled(6), line = tm.tmHeight;
+    int y = pad;
+    SetBkColor(dc, RGB(45, 45, 45));
+    auto text = [&](const std::wstring& s, COLORREF c, int at) {
+        SetTextColor(dc, c);
+        TextOutW(dc, pad, at, s.c_str(), (int)s.size());
+    };
+    const size_t nl = data.report.find(L'\n');
+    const std::wstring notes = !data.width ? data.report : nl == std::wstring::npos ? L"" : data.report.substr(nl + 1);  // the first line is the title
+    for (size_t from = 0; from < notes.size(); y += line) {
+        const size_t end = std::min(notes.find(L'\n', from), notes.size());
+        text(notes.substr(from, end - from), data.width ? RGB(235, 185, 90) : RGB(220, 220, 220), y);
+        from = end + 1;
+    }
+    const size_t room = (size_t)std::max(1, (int)(rc.bottom - pad - 2 * line - y) / line);  // object lines above the hint
+    for (size_t o = 0; o < data.objects.size(); ++o, y += line) {
+        if (o + 1 == room && data.objects.size() > room) {
+            text(L"+ " + std::to_wstring(data.objects.size() - o) + L" more", RGB(160, 160, 160), y);
+            break;
+        }
+        text(data.objects[o], object_color(o), y);
+    }
+    text(L"wheel: zoom   drag: pan   double click: fit", RGB(130, 130, 130), rc.bottom - pad - line);
+    SelectObject(dc, oldFont);
+
+    BitBlt(target, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, oldBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+}
+
+LRESULT PreviewWindow::Message(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_SIZE:
+        if (fitted) Fit();
+        InvalidateRect(hw, nullptr, FALSE);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hw, &ps);
+        RECT rc;
+        GetClientRect(hw, &rc);
+        Paint(dc, rc);
+        EndPaint(hw, &ps);
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        POINT p = point_of(lp);
+        ScreenToClient(hw, &p);
+        const double next = std::clamp(scale * std::pow(1.2, GET_WHEEL_DELTA_WPARAM(wp) / (double)WHEEL_DELTA),
+                                       32.0 / std::max({data.width, data.height, 1}), 64.0);
+        x0 = p.x - (p.x - x0) * next / scale;
+        y0 = p.y - (p.y - y0) * next / scale;
+        scale = next;
+        fitted = false;
+        InvalidateRect(hw, nullptr, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+        SetCapture(hw);
+        dragging = true;
+        drag = point_of(lp);
+        return 0;
+    case WM_MOUSEMOVE:
+        if (dragging) {
+            const POINT p = point_of(lp);
+            x0 += p.x - drag.x;
+            y0 += p.y - drag.y;
+            drag = p;
+            fitted = false;
+            InvalidateRect(hw, nullptr, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+    case WM_MBUTTONUP:
+        ReleaseCapture();
+        return 0;
+    case WM_CAPTURECHANGED:
+        dragging = false;
+        return 0;
+    case WM_LBUTTONDBLCLK:
+        fitted = true;
+        Fit();
+        InvalidateRect(hw, nullptr, FALSE);
+        return 0;
+    case WM_NCDESTROY:
+        hwnd = nullptr;
+        data = {};
+        break;
+    }
+    return DefWindowProcW(hw, msg, wp, lp);
+}
+
+LRESULT CALLBACK PreviewWindow::Proc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_NCCREATE) {
+        auto* self = static_cast<PreviewWindow*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
+        self->hwnd = hw;
+        SetWindowLongPtrW(hw, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+    }
+    auto* self = reinterpret_cast<PreviewWindow*>(GetWindowLongPtrW(hw, GWLP_USERDATA));
+    return self ? self->Message(hw, msg, wp, lp) : DefWindowProcW(hw, msg, wp, lp);
+}
+
 std::wstring file_name(const std::wstring& path) { return std::filesystem::path(path).filename().wstring(); }
 
 void PackMod::UpdateUI(HWND hw) {
@@ -315,8 +626,9 @@ void PackMod::UpdateUI(HWND hw) {
         IParamMap2* map = Map();
         if (!map) return;
         hw = map->GetHWnd();
+        EnablePacking(map);
     }
-    SetDlgItemText(hw, IDC_STATUS, status.data());
+    SetDlgItemText(hw, IDC_STATUS, detectNote.empty() ? status.data() : (std::wstring(status.data()) + L"\n" + detectNote).c_str());
 
     // Objects: the ones the modifier is on, the collapsed ones, then the ones with maps that are
     // neither (removed, or renamed by a script).
@@ -453,6 +765,7 @@ public:
             mod->shownObjects.clear();
             mod->shownLines.clear();
             mod->UpdateUI(hw);
+            mod->EnablePacking(map);
             return TRUE;
         case WM_COMMAND: {
             const int id = LOWORD(wp), code = HIWORD(wp);
@@ -490,6 +803,14 @@ public:
                     mod->pblock->SetValue(kOutDir, 0, dir);
                     theHold.Accept(exodus_string(IDS_OUT_DIR));
                 }
+                return TRUE;
+            }
+            if (id == IDC_DETECT) {
+                mod->Detect();
+                return TRUE;
+            }
+            if (id == IDC_PREVIEW) {
+                mod->Preview();
                 return TRUE;
             }
             if (id == IDC_BAKE) {
@@ -541,6 +862,10 @@ ParamBlockDesc2 packPbDesc(kParams, _M("parameters"), IDS_PARAMETERS, &packDesc,
         p_default, 2,
         p_range, 1, 99,
         p_ui, TYPE_SPINNER, EDITTYPE_INT, IDC_TARGET_EDIT, IDC_TARGET_SPIN, 1.0f,
+        p_end,
+    kKeepLayout, _M("keepLayout"), TYPE_BOOL, 0, IDS_KEEP_LAYOUT,
+        p_default, FALSE,
+        p_ui, TYPE_SINGLECHECKBOX, IDC_KEEP_LAYOUT,
         p_end,
     kSize, _M("size"), TYPE_INT, 0, IDS_SIZE,
         p_default, 0,
@@ -619,5 +944,18 @@ MSTR pack_bake(ReferenceTarget* target) {
     auto* mod = dynamic_cast<PackMod*>(target);
     if (!mod || !packInstances.count(mod)) return _M("not a UDIM Pack modifier");
     MSTR log = mod->Bake();
+    return log + _M("\n") + mod->status;
+}
+
+MSTR pack_detect(ReferenceTarget* target) {
+    auto* mod = dynamic_cast<PackMod*>(target);
+    if (!mod || !packInstances.count(mod)) return _M("not a UDIM Pack modifier");
+    return mod->Detect();
+}
+
+MSTR pack_preview(ReferenceTarget* target) {
+    auto* mod = dynamic_cast<PackMod*>(target);
+    if (!mod || !packInstances.count(mod)) return _M("not a UDIM Pack modifier");
+    MSTR log = mod->Preview();
     return log + _M("\n") + mod->status;
 }

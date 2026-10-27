@@ -105,7 +105,7 @@ MSTR json_error(const MSTR& what) { return MSTR(_M("{\"error\": \"")) + what + _
 class ExodusInterface : public FPStaticInterface {
 public:
     DECLARE_DESCRIPTOR(ExodusInterface)
-    enum { kVersion, kReload, kInspect, kSync, kBake, kMerge };
+    enum { kVersion, kReload, kInspect, kSync, kBake, kMerge, kPreview, kDetect };
 
     BEGIN_FUNCTION_MAP
     FN_0(kVersion, TYPE_TSTR_BV, Version)
@@ -114,10 +114,20 @@ public:
     VFN_0(kSync, Sync)
     FN_1(kBake, TYPE_TSTR_BV, Bake, TYPE_REFTARG)
     FN_1(kMerge, TYPE_TSTR_BV, Merge, TYPE_INODE_TAB_BR)
+    FN_1(kPreview, TYPE_TSTR_BV, Preview, TYPE_REFTARG)
+    FN_1(kDetect, TYPE_TSTR_BV, Detect, TYPE_REFTARG)
     END_FUNCTION_MAP
 
     // Bake of a UDIM Pack modifier, as its button does; returns the report.
     MSTR Bake(ReferenceTarget* modifier) { return pack_bake(modifier); }
+
+    // Preview of a UDIM Pack modifier, as its button does: the layout in the preview window,
+    // nothing written; returns the report.
+    MSTR Preview(ReferenceTarget* modifier) { return pack_preview(modifier); }
+
+    // Auto detect of a UDIM Pack modifier, as its button does: every object's maps from its
+    // material; returns the report.
+    MSTR Detect(ReferenceTarget* modifier) { return pack_detect(modifier); }
 
     // Merges skinned objects into a new one, keeping Skin weights and morphs; returns the report.
     MSTR Merge(Tab<INode*>& nodes) {
@@ -172,6 +182,10 @@ ExodusInterface theInterface(kInterfaceId, _M("exodus"), 0, nullptr, FP_CORE,
         _M("modifier"), 0, TYPE_REFTARG,
     ExodusInterface::kMerge, _M("merge"), 0, TYPE_TSTR_BV, 0, 1,
         _M("nodes"), 0, TYPE_INODE_TAB_BR,
+    ExodusInterface::kPreview, _M("preview"), 0, TYPE_TSTR_BV, 0, 1,
+        _M("modifier"), 0, TYPE_REFTARG,
+    ExodusInterface::kDetect, _M("detect"), 0, TYPE_TSTR_BV, 0, 1,
+        _M("modifier"), 0, TYPE_REFTARG,
     p_end);
 // clang-format on
 

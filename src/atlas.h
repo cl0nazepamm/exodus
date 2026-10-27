@@ -150,6 +150,17 @@ struct Packer {
     bool pack_fill();
     double fillScale = 1;  // the factor pack_fill found
 
+    // ---- 3b. or an existing layout --------------------------------------------------------------
+    // The packed UVs come with the scene instead of from pack(): per mesh, per corner, 0 .. 1 of the
+    // atlas. There are no islands; compose resamples the sources from the face's source UVs to these.
+    std::vector<std::vector<Vec2d>> layoutUv;
+    bool existing_layout() const { return !layoutUv.empty(); }
+
+    // The atlas size for it: o.sizeW x o.sizeH, or the smallest square power of two (up to
+    // o.maxSize) that keeps the maps' texel density over the layout.
+    bool use_layout();
+    double layoutDensity = 1;  // atlas texels per map texel along an edge, over all packed faces
+
     // New UV of a tile-local source UV. Same math as the pixel copy, in continuous coordinates.
     Vec2d new_uv(const Island& isl, const Vec2d& uv, Tile t) const;
 
@@ -161,6 +172,10 @@ struct Packer {
 
     // ---- 4. compose + bleed + verify + write, one channel at a time -------------------------
     bool compose(std::vector<uint8_t>& owned, BleedPlan& plan, std::vector<std::string>& files);
+
+    // compose for an existing layout: every atlas pixel a face covers is sampled from the face's
+    // maps (bilinear, several samples per pixel where the maps are denser than the atlas).
+    bool compose_layout(std::vector<uint8_t>& owned, BleedPlan& plan, std::vector<std::string>& files);
 
     // ---- 5. side outputs ----------------------------------------------------------------------
     void write_layout(const std::vector<uint8_t>& owned);

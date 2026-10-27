@@ -88,6 +88,9 @@ struct ExodusPackMap {
 
 struct ExodusPackSettings {
     int sourceChannel = 1, targetChannel = 2;  // map channels: packed UVs are read from / written to
+    // The target channel already holds a clean pack of all objects: it is the layout (no packing,
+    // nothing written to the mesh) and Bake resamples each face's maps from the source UVs into it.
+    bool keepLayout = false;
     int size = 0;                              // atlas width and height; 0 = smallest that fits
     int maxSize = 8192;
     int padding = 8;
@@ -105,6 +108,16 @@ struct ExodusPackTile {
     std::wstring object;  // node name
     int tile = 1001;
     int faces = 0;        // the object's faces in this tile (source UVs)
+};
+
+// What Preview shows: the edges of the packed faces in the atlas, per object. UVs are the packed
+// ones (0 .. 1, v up), as Bake would write them.
+struct ExodusPackPreview {
+    int width = 0, height = 0;                 // atlas size in pixels; 0 when there is no layout
+    std::wstring report;                       // the layout's status (why there is none, if so)
+    std::vector<std::wstring> objects;         // node names, of the objects with packed faces
+    std::vector<uint32_t> objectFirst;         // object o has the edges objectFirst[o] .. objectFirst[o + 1] - 1
+    std::vector<std::array<float, 4>> edges;   // u0, v0, u1, v1
 };
 
 struct ExodusCoreApi {
@@ -140,6 +153,18 @@ struct ExodusCoreApi {
     // set when that changed the layout (the nodes then need to evaluate again). `log` gets the
     // whole report.
     bool (*pack_bake)(Modifier* self, const ExodusPackSettings& settings, ExodusSink log, std::wstring& status, bool& relayout);
+    // Bake's dry run: re-reads every node and lays out as pack_bake does, writes nothing and gives
+    // the packed faces in `preview`. Returns false when there is no layout (preview.report says why).
+    bool (*pack_preview)(Modifier* self, const ExodusPackSettings& settings, ExodusSink log, std::wstring& status, bool& relayout,
+                         ExodusPackPreview& preview);
+    // Auto detect: the maps of every object the modifier is on (collapsed ones too), from its
+    // material. For each tile the object's source UVs use (and each sub-material its faces there
+    // show), the file of every map slot of a known role (base color, normal, roughness, metallic,
+    // opacity, emission, occlusion) goes into the channel named for that role; a free channel is
+    // named for a role no channel matches. `settings` comes back with the channels and the map
+    // rows: the rows of each object found replaced, the others kept. `report` says what was found.
+    // Returns false when no object had maps.
+    bool (*pack_detect)(Modifier* self, ExodusPackSettings& settings, std::wstring& report);
     void (*pack_forget)(Modifier* self);  // the modifier is gone: drop its layout
 
     // Merges skinned objects into a new one, as one undo step: their meshes at the input of Skin
@@ -149,7 +174,7 @@ struct ExodusCoreApi {
     bool (*merge)(const std::vector<INode*>& nodes, ExodusSink log, INode*& merged);
 };
 
-constexpr int kExodusCoreApiVersion = 11;
+constexpr int kExodusCoreApiVersion = 14;
 
 // The one export of exodus_maxcore.dll.
 extern "C" typedef const ExodusCoreApi* (*ExodusCoreApiFn)();

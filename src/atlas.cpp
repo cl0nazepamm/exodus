@@ -128,6 +128,89 @@ static void raster_tri(const Vec2d p[3], int gw, int gh, F&& mark) {
         }
 }
 
+// Every pixel whose centre lies in the triangle (edges included).
+template <class F>
+static void raster_centers(const Vec2d p[3], int gw, int gh, F&& mark) {
+    const double area = (p[1].x - p[0].x) * (p[2].y - p[0].y) - (p[1].y - p[0].y) * (p[2].x - p[0].x);
+    if (area == 0) return;
+    const double s = area > 0 ? 1.0 : -1.0;
+    const int x0 = std::max(0, (int)std::ceil(std::min({p[0].x, p[1].x, p[2].x}) - 0.5));
+    const int x1 = std::min(gw - 1, (int)std::floor(std::max({p[0].x, p[1].x, p[2].x}) - 0.5));
+    const int y0 = std::max(0, (int)std::ceil(std::min({p[0].y, p[1].y, p[2].y}) - 0.5));
+    const int y1 = std::min(gh - 1, (int)std::floor(std::max({p[0].y, p[1].y, p[2].y}) - 0.5));
+    for (int y = y0; y <= y1; ++y)
+        for (int x = x0; x <= x1; ++x) {
+            const double cx = x + 0.5, cy = y + 0.5;
+            bool in = true;
+            for (int e = 0; e < 3 && in; ++e) {
+                const Vec2d& a = p[e];
+                const Vec2d& b = p[(e + 1) % 3];
+                in = s * ((b.x - a.x) * (cy - a.y) - (b.y - a.y) * (cx - a.x)) >= -1e-9;
+            }
+            if (in) mark(x, y);
+        }
+}
+
+static double tri_area(const Vec2d& a, const Vec2d& b, const Vec2d& c) {
+    return 0.5 * std::abs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x));
+}
+
+// The point of triangle abc nearest p (p itself inside; Ericson, Real-Time Collision Detection 5.1.5).
+static Vec2d nearest_on_tri(const Vec2d& p, const Vec2d& a, const Vec2d& b, const Vec2d& c) {
+    auto dot = [](double ux, double uy, double vx, double vy) { return ux * vx + uy * vy; };
+    const double abx = b.x - a.x, aby = b.y - a.y, acx = c.x - a.x, acy = c.y - a.y;
+    const double d1 = dot(abx, aby, p.x - a.x, p.y - a.y), d2 = dot(acx, acy, p.x - a.x, p.y - a.y);
+    if (d1 <= 0 && d2 <= 0) return a;
+    const double d3 = dot(abx, aby, p.x - b.x, p.y - b.y), d4 = dot(acx, acy, p.x - b.x, p.y - b.y);
+    if (d3 >= 0 && d4 <= d3) return b;
+    const double vc = d1 * d4 - d3 * d2;
+    if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+        const double v = d1 / (d1 - d3);
+        return {a.x + v * abx, a.y + v * aby};
+    }
+    const double d5 = dot(abx, aby, p.x - c.x, p.y - c.y), d6 = dot(acx, acy, p.x - c.x, p.y - c.y);
+    if (d6 >= 0 && d5 <= d6) return c;
+    const double vb = d5 * d2 - d1 * d6;
+    if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+        const double w = d2 / (d2 - d6);
+        return {a.x + w * acx, a.y + w * acy};
+    }
+    const double va = d3 * d6 - d5 * d4;
+    if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) {
+        const double w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return {b.x + w * (c.x - b.x), b.y + w * (c.y - b.y)};
+    }
+    return p;
+}
+
+// Bilinear sample of `im` at the continuous pixel position (x, y) (pixel i spans i .. i + 1); added
+// to `acc` at the atlas channel's count and depth. Inside the map the taps stop at its border; a
+// position outside it (UVs that tile) repeats the map, as on the model.
+static void sample_bilinear(const Image& im, double x, double y, int c, int bps, double acc[4]) {
+    const bool inX = x >= 0 && x <= im.w, inY = y >= 0 && y <= im.h;
+    x -= 0.5;
+    y -= 0.5;
+    const int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
+    const double fx = x - x0, fy = y - y0;
+    auto tap = [](int i, int n, bool in) { return in ? std::clamp(i, 0, n - 1) : wrap(i, n); };
+    const int xa = tap(x0, im.w, inX), xb = tap(x0 + 1, im.w, inX), ya = tap(y0, im.h, inY), yb = tap(y0 + 1, im.h, inY);
+    uint32_t a[4], b[4], d[4], e[4];
+    promote_pixel(im, (size_t)ya * im.w + xa, c, bps, a);
+    promote_pixel(im, (size_t)ya * im.w + xb, c, bps, b);
+    promote_pixel(im, (size_t)yb * im.w + xa, c, bps, d);
+    promote_pixel(im, (size_t)yb * im.w + xb, c, bps, e);
+    for (int k = 0; k < c; ++k) acc[k] += (a[k] * (1 - fx) + b[k] * fx) * (1 - fy) + (d[k] * (1 - fx) + e[k] * fx) * fy;
+}
+
+// Turns a tangent-space normal (RG of `v`, 0 .. maxv) by the rotation or mirror `r` (2x2, row
+// major, v up) its UV frame went through. DX stores -Y, so it is turned in GL terms.
+static void turn_normal(int kind, const double r[4], double v[4], double maxv) {
+    const double sy = kind == KIND_NORMAL_DX ? -1 : 1;
+    const double x = v[0] / maxv * 2 - 1, y = sy * (v[1] / maxv * 2 - 1);
+    v[0] = (r[0] * x + r[1] * y + 1) * 0.5 * maxv;
+    v[1] = (sy * (r[2] * x + r[3] * y) + 1) * 0.5 * maxv;
+}
+
 static std::string json_str(const std::string& s) {
     std::string o = "\"";
     for (unsigned char ch : s) {
@@ -639,6 +722,52 @@ bool Packer::pack_fill() {
     return pack();
 }
 
+// ---- 3b. or an existing layout -------------------------------------------------------------
+bool Packer::use_layout() {
+    double mapArea = 0, layoutArea = 0;  // in map texels, in layout UV
+    size_t outside = 0;
+    for (size_t mi = 0; mi < scene.meshes.size(); ++mi) {
+        const InMesh& mesh = scene.meshes[mi];
+        if (mi >= layoutUv.size() || layoutUv[mi].size() != mesh.cornerUv.size()) {
+            say("the layout UVs of %s do not match its faces\n", mesh.name.c_str());
+            return false;
+        }
+        std::vector<uint8_t> out(mesh.faces.size(), 0);
+        for (size_t ti = 0; ti < mesh.tris.size(); ++ti) {
+            const uint32_t fi = mesh.triFace[ti];
+            const int sid = faceSource[mi][fi];
+            if (sid < 0) continue;
+            Vec2d p[3], q[3];
+            for (int k = 0; k < 3; ++k) {
+                const uint32_t c = mesh.tris[ti][k];
+                p[k] = src_px(sources[sid], mesh.uvs[mesh.cornerUv[c]], faceTile[mi][fi]);
+                q[k] = layoutUv[mi][c];
+                out[fi] |= q[k].x < -1e-6 || q[k].y < -1e-6 || q[k].x > 1 + 1e-6 || q[k].y > 1 + 1e-6;
+            }
+            mapArea += tri_area(p[0], p[1], p[2]);
+            layoutArea += tri_area(q[0], q[1], q[2]);
+        }
+        for (uint8_t o : out) outside += o;
+    }
+    if (layoutArea <= 0 || mapArea <= 0) {
+        say("the packed faces cover no area in the layout\n");
+        return false;
+    }
+    if (outside) say("  ! %zu faces reach outside 0..1 of the layout: cut off at the atlas border\n", outside);
+    if (o.sizeW > 0) {
+        AW = o.sizeW;
+        AH = o.sizeH;
+    } else {
+        const double side = std::sqrt(mapArea / layoutArea);  // atlas texels per layout UV unit at the maps' density
+        AW = 256;
+        while (AW < side && AW * 2 <= o.maxSize) AW *= 2;
+        AH = AW;
+    }
+    layoutDensity = std::sqrt((double)AW * AH * layoutArea / mapArea);
+    say("  existing layout: %dx%d atlas, %.0f%% of the maps' texel density\n", AW, AH, layoutDensity * 100);
+    return true;
+}
+
 // New UV of a tile-local source UV. Same math as the pixel copy, in continuous coordinates.
 Vec2d Packer::new_uv(const Island& isl, const Vec2d& uv, Tile t) const {
     const Source& s = sources[isl.source];
@@ -688,6 +817,7 @@ void Packer::fill_value(const Source& s, const Channel& ch, uint32_t out[4]) con
 
 // ---- 4. compose + bleed + verify + write, one channel at a time -------------------------
 bool Packer::compose(std::vector<uint8_t>& owned, BleedPlan& plan, std::vector<std::string>& files) {
+    if (existing_layout()) return compose_layout(owned, plan, files);
     owned.assign((size_t)AW * AH, 0);
     size_t overlaps = 0;
     for (const Island& isl : islands)
@@ -801,6 +931,170 @@ bool Packer::compose(std::vector<uint8_t>& owned, BleedPlan& plan, std::vector<s
     return true;
 }
 
+bool Packer::compose_layout(std::vector<uint8_t>& owned, BleedPlan& plan, std::vector<std::string>& files) {
+    // Per packed triangle: its corners in atlas pixels, the affine map from there to its source's
+    // pixels, the samples per pixel, and how its UV frame turned (for normal maps).
+    struct LayoutTri {
+        int source = 0;
+        Vec2d dst[3], src0;
+        double m[4] = {};      // source pixel = src0 + m * (atlas pixel - dst[0])
+        int n = 1;             // n x n samples per atlas pixel
+        double turn[4] = {1, 0, 0, 1};
+        bool turned = false;
+    };
+    std::vector<LayoutTri> tris;
+    size_t flat = 0;
+    for (size_t mi = 0; mi < scene.meshes.size(); ++mi) {
+        const InMesh& mesh = scene.meshes[mi];
+        for (size_t ti = 0; ti < mesh.tris.size(); ++ti) {
+            const uint32_t fi = mesh.triFace[ti];
+            const int sid = faceSource[mi][fi];
+            if (sid < 0) continue;
+            const Tile tile = faceTile[mi][fi];
+            LayoutTri t;
+            t.source = sid;
+            Vec2d uv[3], lay[3], sp[3];
+            for (int k = 0; k < 3; ++k) {
+                const uint32_t c = mesh.tris[ti][k];
+                uv[k] = mesh.uvs[mesh.cornerUv[c]];
+                lay[k] = layoutUv[mi][c];
+                sp[k] = src_px(sources[sid], uv[k], tile);
+                t.dst[k] = {lay[k].x * AW, (1.0 - lay[k].y) * AH};
+            }
+            const Vec2d d1{t.dst[1].x - t.dst[0].x, t.dst[1].y - t.dst[0].y}, d2{t.dst[2].x - t.dst[0].x, t.dst[2].y - t.dst[0].y};
+            const Vec2d s1{sp[1].x - sp[0].x, sp[1].y - sp[0].y}, s2{sp[2].x - sp[0].x, sp[2].y - sp[0].y};
+            const double det = d1.x * d2.y - d2.x * d1.y;
+            if (std::abs(det) < 1e-12) {
+                ++flat;
+                continue;
+            }
+            t.src0 = sp[0];
+            t.m[0] = (s1.x * d2.y - s2.x * d1.y) / det;
+            t.m[1] = (s2.x * d1.x - s1.x * d2.x) / det;
+            t.m[2] = (s1.y * d2.y - s2.y * d1.y) / det;
+            t.m[3] = (s2.y * d1.x - s1.y * d2.x) / det;
+            // Where the maps are denser than the atlas, enough samples to cover every source texel.
+            const double step = std::max(std::hypot(t.m[0], t.m[2]), std::hypot(t.m[1], t.m[3]));
+            t.n = std::clamp((int)std::ceil(step - 1e-6), 1, 16);
+            // The UV frame's turn: the rotation (or mirror) nearest the source UV -> layout UV map.
+            const Vec2d e1{uv[1].x - uv[0].x, uv[1].y - uv[0].y}, e2{uv[2].x - uv[0].x, uv[2].y - uv[0].y};
+            const Vec2d f1{lay[1].x - lay[0].x, lay[1].y - lay[0].y}, f2{lay[2].x - lay[0].x, lay[2].y - lay[0].y};
+            const double de = e1.x * e2.y - e2.x * e1.y;
+            if (std::abs(de) > 1e-18) {
+                const double a = (f1.x * e2.y - f2.x * e1.y) / de, b = (f2.x * e1.x - f1.x * e2.x) / de;
+                const double c = (f1.y * e2.y - f2.y * e1.y) / de, d = (f2.y * e1.x - f1.y * e2.x) / de;
+                if (a * d - b * c >= 0) {
+                    const double th = std::atan2(c - b, a + d);
+                    t.turn[0] = std::cos(th); t.turn[1] = -std::sin(th);
+                    t.turn[2] = std::sin(th); t.turn[3] = std::cos(th);
+                } else {
+                    const double ph = std::atan2(b + c, a - d);
+                    t.turn[0] = std::cos(ph); t.turn[1] = std::sin(ph);
+                    t.turn[2] = std::sin(ph); t.turn[3] = -std::cos(ph);
+                }
+                t.turned = std::abs(t.turn[0] - 1) > 1e-4 || std::abs(t.turn[3] - 1) > 1e-4 || std::abs(t.turn[1]) > 1e-4 ||
+                           std::abs(t.turn[2]) > 1e-4;
+            }
+            tris.push_back(t);
+        }
+    }
+    if (flat) say("  ! %zu triangles have no area in the layout (left out)\n", flat);
+    if (tris.empty()) {
+        say("no packed face has area in the layout\n");
+        return false;
+    }
+
+    // A pixel belongs to the triangle that holds its centre (1), else to one that touches it (2):
+    // the islands' edge pixels are sampled too before the bleed fills the rest.
+    owned.assign((size_t)AW * AH, 0);
+    size_t shared = 0;
+    {
+        std::vector<uint16_t> by(sources.size() < 0xFFFF ? (size_t)AW * AH : 0, 0);  // source + 1 at the pixel's centre
+        for (const LayoutTri& t : tris)
+            raster_centers(t.dst, AW, AH, [&](int x, int y) {
+                const size_t i = (size_t)y * AW + x;
+                owned[i] = 1;
+                if (by.empty()) return;
+                if (by[i] && by[i] != t.source + 1) ++shared;
+                by[i] = (uint16_t)(t.source + 1);
+            });
+    }
+    for (const LayoutTri& t : tris)
+        raster_tri(t.dst, AW, AH, [&](int x, int y) {
+            uint8_t& m = owned[(size_t)y * AW + x];
+            if (!m) m = 2;
+        });
+    if (shared) say("  ! %zu atlas pixels are covered by faces with different maps: islands overlap in the layout\n", shared);
+
+    auto t0 = Clock::now();
+    plan = make_bleed_plan(owned, AW, AH);
+    say("  bleed plan: %zu background pixels, %.0f ms\n", plan.order.size(),
+        std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+
+    for (size_t ci = 0; ci < channels.size(); ++ci) {
+        const Channel& ch = channels[ci];
+        t0 = Clock::now();
+        Image atlas;
+        atlas.alloc(AW, AH, ch.c, ch.bps);
+        const double maxv = atlas.maxv();
+        std::vector<Image> srcImg(sources.size());
+        std::vector<std::array<uint32_t, 4>> fill(sources.size());
+        for (size_t sid = 0; sid < sources.size(); ++sid) {
+            const Source& s = sources[sid];
+            fill[sid] = {0, 0, 0, 0};
+            if (!s.nomap && s.tex[ci] >= 0) {
+                if (!source_image(s, (int)ci, srcImg[sid])) return false;
+            } else {
+                fill_value(s, ch, fill[sid].data());
+            }
+        }
+        for (int pass = 0; pass < 2; ++pass)
+            for (const LayoutTri& t : tris) {
+                const Image& im = srcImg[t.source];
+                auto put = [&](int x, int y) {
+                    const size_t i = (size_t)y * AW + x;
+                    if (pass == 1 && owned[i] != 2) return;  // the centres are drawn
+                    double v[4] = {0, 0, 0, 0};
+                    if (im.empty()) {
+                        for (int k = 0; k < ch.c; ++k) v[k] = fill[t.source][k];
+                    } else {
+                        // Samples that fall off the face (edge pixels, corners of pixels) take its nearest point.
+                        for (int sy = 0; sy < t.n; ++sy)
+                            for (int sx = 0; sx < t.n; ++sx) {
+                                const Vec2d p = nearest_on_tri({x + (sx + 0.5) / t.n, y + (sy + 0.5) / t.n}, t.dst[0], t.dst[1], t.dst[2]);
+                                const double px = p.x - t.dst[0].x, py = p.y - t.dst[0].y;
+                                sample_bilinear(im, t.src0.x + t.m[0] * px + t.m[1] * py, t.src0.y + t.m[2] * px + t.m[3] * py, ch.c, ch.bps, v);
+                            }
+                        for (int k = 0; k < ch.c; ++k) v[k] /= (double)t.n * t.n;
+                        if (t.turned && ch.kind != KIND_COLOR && ch.c >= 2) turn_normal(ch.kind, t.turn, v, maxv);
+                    }
+                    for (int k = 0; k < ch.c; ++k) atlas.set(i, k, (uint32_t)std::clamp(std::lround(v[k]), 0L, (long)maxv));
+                };
+                if (pass == 0) raster_centers(t.dst, AW, AH, put);
+                else raster_tri(t.dst, AW, AH, put);
+            }
+        srcImg.clear();
+        const double composeMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+
+        t0 = Clock::now();
+        apply_bleed(atlas, plan, ch.kind != KIND_COLOR);
+        const double bleedMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+
+        const std::string file = o.prefix + "_" + safe_name(ch.name) + ".png";
+        std::string err;
+        t0 = Clock::now();
+        if (!save_png(ustr(upath(o.outDir) / upath(file)), atlas, err)) {
+            say("cannot write %s: %s\n", file.c_str(), err.c_str());
+            return false;
+        }
+        const double saveMs = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+        files.push_back(file);
+        say("  %-18s %dch %2d-bit  resample %5.0f ms  bleed %5.0f ms  png %6.0f ms\n", ch.name.c_str(), ch.c, ch.bps * 8, composeMs,
+            bleedMs, saveMs);
+    }
+    return true;
+}
+
 // ---- 5. side outputs ----------------------------------------------------------------------
 void Packer::write_layout(const std::vector<uint8_t>& owned) {
     const int f = std::max(1, (std::max(AW, AH) + 2047) / 2048);
@@ -823,7 +1117,11 @@ void Packer::write_layout(const std::vector<uint8_t>& owned) {
                     for (int c = 0; c < 3; ++c) img.set((size_t)Y * img.w + X, c, col[c]);
             }
     }
-    (void)owned;
+    if (existing_layout())  // no islands: the pixels the faces cover, edge pixels darker
+        for (int Y = 0; Y < AH; ++Y)
+            for (int X = 0; X < AW; ++X)
+                if (const uint8_t m = owned[(size_t)Y * AW + X]; m && X / f < img.w && Y / f < img.h)
+                    for (int c = 0; c < 3; ++c) img.set((size_t)(Y / f) * img.w + X / f, c, m == 1 ? 170 : 110);
     std::string err;
     save_png(ustr(upath(o.outDir) / upath(o.prefix + "_layout.png")), img, err);
 }
@@ -897,8 +1195,12 @@ void Packer::write_obj(const std::string& previewFile) {
 void Packer::write_manifest(const std::vector<std::string>& files) {
     FILE* f = _wfopen((upath(o.outDir) / upath(o.prefix + "_manifest.json")).c_str(), L"wb");
     if (!f) return;
-    std::fprintf(f, "{\n  \"input\": %s,\n  \"atlas\": {\"width\": %d, \"height\": %d, \"padding\": %d},\n",
-                 json_str(scene.sourcePath).c_str(), AW, AH, o.padding);
+    if (existing_layout())
+        std::fprintf(f, "{\n  \"input\": %s,\n  \"atlas\": {\"width\": %d, \"height\": %d, \"layout\": \"existing\", \"density\": %.6g},\n",
+                     json_str(scene.sourcePath).c_str(), AW, AH, layoutDensity);
+    else
+        std::fprintf(f, "{\n  \"input\": %s,\n  \"atlas\": {\"width\": %d, \"height\": %d, \"padding\": %d},\n",
+                     json_str(scene.sourcePath).c_str(), AW, AH, o.padding);
     if (unsubdivided) {
         std::fprintf(f, "  \"unsubdivide\": {\"levels\": %d, \"quad_dominant\": %s, \"cage\": %s, \"faces_in\": %zu, \"faces_out\": %zu, "
                         "\"triangles_in\": %zu, \"triangles_out\": %zu, \"fit_rms\": %.6g, \"fit_max\": %.6g, \"meshes\": [",

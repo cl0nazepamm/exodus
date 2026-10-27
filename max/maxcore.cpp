@@ -1,6 +1,8 @@
 // Exodus for 3ds Max: the work, in a DLL the plugin loads from a copy and can reload
 // (see maxcore_api.h). Everything here runs on Max's main thread, called from the plugin.
 #include <max.h>
+#include <AssetEnumCallback.h>
+#include <AssetManagement/AssetUser.h>
 #include <imorpher.h>
 #include <iskin.h>
 #pragma warning(push)
@@ -25,6 +27,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "atlas.h"
@@ -866,6 +869,8 @@ bool write_weights(INode* node, Modifier* self, ExodusReduceState& st, const std
 // maps come per UDIM tile from the settings, for all objects or for one object by name: every
 // tile with maps becomes one material of the packer's scene, an object's own maps one of their
 // own, faces in other tiles are left out. Materials in the scene are not read.
+// Keep layout: the target channel already is the layout (separate objects packed by hand), so
+// nothing is packed or written to the mesh; Bake resamples each face's maps into that layout.
 
 // One node's input: the faces and source UVs the layout is made from.
 struct PackPart {
@@ -876,6 +881,8 @@ struct PackPart {
     bool collapsed = false;  // read from the base object of an object collapsed with the modifier
     int target = 0;          // collapsed: the target channel read into `baked`
     std::vector<UVVert> baked;  // collapsed: its target channel per corner of the live faces (the UVs it was packed with)
+    int layoutChannel = 0;      // keep layout: the channel read into `layout`, else 0
+    std::vector<Vec2d> layout;  // keep layout: that channel per corner of the live faces
 };
 
 struct PackUVs {  // one node's packed UVs
@@ -953,7 +960,10 @@ std::vector<PackUse> uses_of(Modifier* mod) {
     return uses;
 }
 
-bool make_part(MNMesh& m, int channel, PackPart& p, std::string& err) {
+// The channel a part's layout is read from: the target channel when the layout is kept, else none.
+int layout_channel(const ExodusPackSettings& s) { return s.keepLayout ? s.targetChannel : 0; }
+
+bool make_part(MNMesh& m, int channel, int layoutChannel, PackPart& p, std::string& err) {
     MNMap* map = channel >= 1 && channel < m.MNum() ? m.M(channel) : nullptr;
     if (!map || map->GetFlag(MN_DEAD) || map->FNum() != m.FNum() || map->VNum() == 0) {
         err = "no UVs in map channel " + std::to_string(channel);
@@ -1002,19 +1012,45 @@ bool make_part(MNMesh& m, int channel, PackPart& p, std::string& err) {
             for (int k = 0; k < 3; ++k) h.add((uint64_t)tri[t + k]);
         }
     }
+    if (layoutChannel) {
+        MNMap* lm = layoutChannel >= 1 && layoutChannel < m.MNum() ? m.M(layoutChannel) : nullptr;
+        if (!lm || lm->GetFlag(MN_DEAD) || lm->FNum() != m.FNum() || lm->VNum() == 0) {
+            err = "no UVs in map channel " + std::to_string(layoutChannel) + " to keep";
+            return false;
+        }
+        p.layoutChannel = layoutChannel;
+        h.add((uint64_t)layoutChannel << 32);
+        for (int f : ct.faces) {
+            const MNMapFace* mf = lm->F(f);
+            if (mf->deg != m.F(f)->deg) {
+                err = "map channel " + std::to_string(layoutChannel) + " does not match the faces";
+                return false;
+            }
+            for (int k = 0; k < mf->deg; ++k) {
+                if (mf->tv[k] < 0 || mf->tv[k] >= lm->VNum()) {
+                    err = "map channel " + std::to_string(layoutChannel) + " has broken faces";
+                    return false;
+                }
+                const UVVert& uv = lm->v[mf->tv[k]];
+                p.layout.push_back({uv.x, uv.y});
+                h.add(std::bit_cast<uint32_t>(uv.x));
+                h.add(std::bit_cast<uint32_t>(uv.y));
+            }
+        }
+    }
     p.signature = h.h;
     return true;
 }
 
 // A node's input, evaluated below the modifier.
-bool read_part(const PackUse& u, TimeValue t, int channel, PackPart& p, std::string& err) {
+bool read_part(const PackUse& u, TimeValue t, const ExodusPackSettings& s, PackPart& p, std::string& err) {
     ObjectState os = u.index + 1 < u.owner->NumModifiers() ? u.owner->Eval(t, u.index + 1) : u.owner->GetObjRef()->Eval(t);
     if (!os.obj || !os.obj->CanConvertToType(polyObjectClassID)) {
         err = "not a mesh";
         return false;
     }
     auto* po = static_cast<PolyObject*>(os.obj->ConvertToType(t, polyObjectClassID));
-    const bool ok = make_part(po->GetMesh(), channel, p, err);
+    const bool ok = make_part(po->GetMesh(), s.sourceChannel, layout_channel(s), p, err);
     if (po != os.obj) po->MaybeAutoDelete();
     return ok;
 }
@@ -1030,7 +1066,7 @@ bool read_collapsed(INode* node, TimeValue t, const ExodusPackSettings& s, PackP
     }
     auto* po = static_cast<PolyObject*>(os.obj->ConvertToType(t, polyObjectClassID));
     MNMesh& m = po->GetMesh();
-    const bool ok = make_part(m, s.sourceChannel, p, err);
+    const bool ok = make_part(m, s.sourceChannel, layout_channel(s), p, err);
     if (ok) {
         p.collapsed = true;
         p.target = s.targetChannel;
@@ -1057,7 +1093,9 @@ std::set<ULONG> read_collapsed_parts(PackState& st, const std::vector<PackUse>& 
         if (!n || std::any_of(uses.begin(), uses.end(), [&](const PackUse& u) { return u.node == n; })) continue;
         kept.insert(n->GetHandle());
         auto it = st.parts.find(n->GetHandle());
-        if (it != st.parts.end() && it->second.collapsed && it->second.channel == s.sourceChannel && it->second.target == s.targetChannel) continue;
+        if (it != st.parts.end() && it->second.collapsed && it->second.channel == s.sourceChannel && it->second.target == s.targetChannel &&
+            it->second.layoutChannel == layout_channel(s))
+            continue;
         PackPart part;
         std::string err;
         if (read_collapsed(n, t, s, part, err)) {
@@ -1105,6 +1143,7 @@ uint64_t layout_signature(const PackState& st, const ExodusPackSettings& s) {
     h.add((uint64_t)s.maxSize);
     h.add((uint64_t)s.padding);
     h.add(s.rotate);
+    h.add(s.keepLayout);
     for (int c = 0; c < kExodusPackChannels; ++c) {
         add_text(h, s.channel[c]);
         h.add((uint64_t)s.kind[c]);
@@ -1183,7 +1222,7 @@ void make_layout(PackState& st, const ExodusPackSettings& s) {
     auto P = std::make_unique<Packer>();
     PackOptions& o = P->o;
     o.sizeW = o.sizeH = s.size;
-    o.fill = s.size > 0;  // a size is filled: the islands scaled to it (0: their own size, smallest atlas)
+    o.fill = s.size > 0 && !s.keepLayout;  // a size is filled: the islands scaled to it (0: their own size, smallest atlas)
     o.maxSize = s.maxSize;
     o.padding = s.padding;
     o.rotate = s.rotate;
@@ -1231,6 +1270,7 @@ void make_layout(PackState& st, const ExodusPackSettings& s) {
             if (f.material) used.insert(f.material);
         }
         scene.meshes.push_back(std::move(mesh));
+        if (s.keepLayout) P->layoutUv.push_back(part.layout);
         order.push_back(handle);
     }
 
@@ -1239,16 +1279,29 @@ void make_layout(PackState& st, const ExodusPackSettings& s) {
         st.report = last_line(st.log);
         return;
     }
-    P->build_islands();
-    if (!(o.fill ? P->pack_fill() : P->pack())) {
-        st.report = last_line(st.log);
-        return;
-    }
-    for (size_t mi = 0; mi < order.size(); ++mi) st.uvs[order[mi]] = packed_uvs(*P, mi, st.parts[order[mi]]);
     char line[256];
-    std::snprintf(line, sizeof line, "%zu tile%s, %zu islands, %dx%d atlas, %zu map%s", used.size(), used.size() == 1 ? "" : "s",
-                  P->islands.size(), P->AW, P->AH, P->channels.size(), P->channels.size() == 1 ? "" : "s");
-    st.report = line;
+    if (s.keepLayout) {
+        // The target channel is the layout: nothing to pack, and the mesh keeps its UVs.
+        if (!P->use_layout()) {
+            st.report = last_line(st.log);
+            return;
+        }
+        std::snprintf(line, sizeof line, "%zu tile%s, layout of channel %d kept, %dx%d atlas at %.0f%% density, %zu map%s", used.size(),
+                      used.size() == 1 ? "" : "s", s.targetChannel, P->AW, P->AH, P->layoutDensity * 100, P->channels.size(),
+                      P->channels.size() == 1 ? "" : "s");
+        st.report = line;
+        if (s.sourceChannel == s.targetChannel) st.report += "\nsource and target are one channel: the maps' own UVs are the layout";
+    } else {
+        P->build_islands();
+        if (!(o.fill ? P->pack_fill() : P->pack())) {
+            st.report = last_line(st.log);
+            return;
+        }
+        for (size_t mi = 0; mi < order.size(); ++mi) st.uvs[order[mi]] = packed_uvs(*P, mi, st.parts[order[mi]]);
+        std::snprintf(line, sizeof line, "%zu tile%s, %zu islands, %dx%d atlas, %zu map%s", used.size(), used.size() == 1 ? "" : "s",
+                      P->islands.size(), P->AW, P->AH, P->channels.size(), P->channels.size() == 1 ? "" : "s");
+        st.report = line;
+    }
     if (o.fill) {
         std::snprintf(line, sizeof line, ", filled at %.0f%% of the maps' size", P->fillScale * 100);
         st.report += line;
@@ -1261,7 +1314,7 @@ void make_layout(PackState& st, const ExodusPackSettings& s) {
     // A collapsed object keeps the UVs it was packed with: if this layout gives it others (settings
     // or maps changed since), it no longer matches the atlas.
     for (const auto& [handle, part] : st.parts) {
-        if (!part.collapsed) continue;
+        if (!part.collapsed || s.keepLayout) continue;  // a kept layout is read from the collapsed mesh itself
         const PackUVs& uv = st.uvs[handle];
         bool same = uv.tv.size() == part.baked.size();
         for (size_t c = 0; same && c < uv.tv.size(); ++c)
@@ -1271,7 +1324,7 @@ void make_layout(PackState& st, const ExodusPackSettings& s) {
     for (int c = 0; c < kExodusPackChannels; ++c) {
         std::wstring low = s.channel[c];
         for (wchar_t& ch : low) ch = (wchar_t)towlower(ch);
-        if (s.rotate && s.kind[c] == 0 && low.find(L"normal") != std::wstring::npos)
+        if ((s.rotate || s.keepLayout) && s.kind[c] == 0 && low.find(L"normal") != std::wstring::npos)
             st.report += "\n'" + utf8(s.channel[c].c_str()) + "' looks like a normal map: set its type, or turned islands get wrong tangents";
     }
     st.packer = std::move(P);
@@ -1319,17 +1372,19 @@ bool pack_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, cons
     // This node's part from its input; the other parts evaluated below the modifier when unknown.
     if (node) {
         PackPart part;
-        if (make_part(mesh, s.sourceChannel, part, err)) st.parts[node->GetHandle()] = std::move(part);
+        if (make_part(mesh, s.sourceChannel, layout_channel(s), part, err)) st.parts[node->GetHandle()] = std::move(part);
         else st.parts.erase(node->GetHandle());
     }
     const TimeValue t = GetCOREInterface()->GetTime();
     for (const PackUse& u : uses) {
         if (u.node == node) continue;
         auto it = st.parts.find(u.node->GetHandle());
-        if (it != st.parts.end() && it->second.channel == s.sourceChannel && !it->second.collapsed) continue;
+        if (it != st.parts.end() && it->second.channel == s.sourceChannel && it->second.layoutChannel == layout_channel(s) &&
+            !it->second.collapsed)
+            continue;
         PackPart part;
         std::string ignore;
-        if (read_part(u, t, s.sourceChannel, part, ignore)) st.parts[u.node->GetHandle()] = std::move(part);
+        if (read_part(u, t, s, part, ignore)) st.parts[u.node->GetHandle()] = std::move(part);
         else st.parts.erase(u.node->GetHandle());
     }
     std::string ignore;
@@ -1353,7 +1408,7 @@ bool pack_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, cons
         report = "node not found";
     } else if (!err.empty()) {
         report = utf8(node->GetName()) + ": " + err;
-    } else if (st.ok) {
+    } else if (st.ok && !s.keepLayout) {
         auto it = st.uvs.find(node->GetHandle());
         if (it == st.uvs.end() || !write_uvs(mesh, s.targetChannel, it->second)) report += "\nthe layout does not fit this mesh";
     }
@@ -1373,6 +1428,29 @@ bool pack_modify(Modifier* self, ModContext& mc, INode* node, MNMesh& mesh, cons
     return changed && uses.size() > 1;
 }
 
+// Bake and Preview: every part read again (a part the viewport has not evaluated since it changed
+// would be stale) and laid out again when that changed the layout. Returns the packer's report
+// with the parts that could not be read.
+std::string reread_layout(Modifier* self, PackState& st, const ExodusPackSettings& s, bool& relayout) {
+    const TimeValue t = GetCOREInterface()->GetTime();
+    st.parts.clear();
+    std::string log, err;
+    const std::vector<PackUse> uses = uses_of(self);
+    for (const PackUse& u : uses) {
+        PackPart part;
+        if (read_part(u, t, s, part, err)) st.parts[u.node->GetHandle()] = std::move(part);
+        else log += "  ! " + utf8(u.node->GetName()) + ": " + err + "\n";
+    }
+    read_collapsed_parts(st, uses, s, t, log);
+    const uint64_t signature = layout_signature(st, s);
+    if (signature != st.layout || !st.packer) {
+        make_layout(st, s);
+        st.layout = signature;
+        relayout = true;
+    }
+    return st.log + log;
+}
+
 bool pack_bake(Modifier* self, const ExodusPackSettings& s, ExodusSink out, std::wstring& status, bool& relayout) {
     std::lock_guard guard(packLock);
     Busy busy(self);
@@ -1384,25 +1462,7 @@ bool pack_bake(Modifier* self, const ExodusPackSettings& s, ExodusSink out, std:
     };
     if (!busy.entered) return fail("busy");
     PackState& st = packs[self];
-
-    // Every part read again: a part the viewport has not evaluated since it changed would be stale.
-    const TimeValue t = GetCOREInterface()->GetTime();
-    st.parts.clear();
-    std::string log, err;
-    const std::vector<PackUse> uses = uses_of(self);
-    for (const PackUse& u : uses) {
-        PackPart part;
-        if (read_part(u, t, s.sourceChannel, part, err)) st.parts[u.node->GetHandle()] = std::move(part);
-        else log += "  ! " + utf8(u.node->GetName()) + ": " + err + "\n";
-    }
-    read_collapsed_parts(st, uses, s, t, log);
-    const uint64_t signature = layout_signature(st, s);
-    if (signature != st.layout || !st.packer) {
-        make_layout(st, s);
-        st.layout = signature;
-        relayout = true;
-    }
-    log = st.log + log;
+    std::string log = reread_layout(self, st, s, relayout);
     if (!st.ok) return fail(log + st.report);
 
     std::filesystem::path dir = s.outDir;
@@ -1436,8 +1496,12 @@ bool pack_bake(Modifier* self, const ExodusPackSettings& s, ExodusSink out, std:
     out.write(out.ctx, log.data(), log.size());
     if (!ok) return fail(last_line(log));
     char line[512];
-    std::snprintf(line, sizeof line, "baked %zu map%s %dx%d, %zu of %zu samples differ\n%s", P.channels.size(), P.channels.size() == 1 ? "" : "s",
-                  P.AW, P.AH, P.verifyMismatches, P.verifySamples, P.o.outDir.c_str());
+    if (P.existing_layout())  // resampled, so there is no texel-exact check
+        std::snprintf(line, sizeof line, "baked %zu map%s %dx%d into the kept layout\n%s", P.channels.size(), P.channels.size() == 1 ? "" : "s",
+                      P.AW, P.AH, P.o.outDir.c_str());
+    else
+        std::snprintf(line, sizeof line, "baked %zu map%s %dx%d, %zu of %zu samples differ\n%s", P.channels.size(),
+                      P.channels.size() == 1 ? "" : "s", P.AW, P.AH, P.verifyMismatches, P.verifySamples, P.o.outDir.c_str());
     std::string text = line;
     for (size_t at = st.report.find(" was collapsed with another layout"); at != std::string::npos;
          at = st.report.find(" was collapsed with another layout", at + 1)) {
@@ -1446,6 +1510,331 @@ bool pack_bake(Modifier* self, const ExodusPackSettings& s, ExodusSink out, std:
     }
     status = wide(text);
     return P.verifyMismatches == 0;
+}
+
+// Bake's dry run: the layout Bake would write, as the packed faces' edges per object; nothing is
+// written. An edge shared by two faces of an island is given once.
+bool pack_preview(Modifier* self, const ExodusPackSettings& s, ExodusSink out, std::wstring& status, bool& relayout,
+                  ExodusPackPreview& preview) {
+    std::lock_guard guard(packLock);
+    Busy busy(self);
+    relayout = false;
+    preview = {};
+    if (!busy.entered) {
+        status = preview.report = L"busy";
+        return false;
+    }
+    PackState& st = packs[self];
+    const std::string log = reread_layout(self, st, s, relayout);
+    out.write(out.ctx, log.data(), log.size());
+    status = wide(st.report + "\n" + objects_line(st));
+    preview.report = wide(st.report);
+    if (!st.ok) return false;
+
+    const Packer& P = *st.packer;
+    const bool kept = P.existing_layout();
+    preview.width = P.AW;
+    preview.height = P.AH;
+    for (size_t mi = 0; mi < P.scene.meshes.size(); ++mi) {
+        const InMesh& mesh = P.scene.meshes[mi];
+        // (source UV, island) -> packed UV, as packed_uvs makes them; a kept layout's UVs by value
+        std::unordered_map<uint64_t, uint32_t> index;
+        std::vector<Vec2d> uv;
+        std::unordered_set<uint64_t> seen;  // edges by their packed UVs
+        const size_t first = preview.edges.size();
+        for (size_t fi = 0; fi < mesh.faces.size(); ++fi) {
+            const int isl = kept ? -1 : P.faceIsland[mi][fi];
+            if (P.faceSource[mi][fi] < 0 || (!kept && isl < 0)) continue;
+            const InFace& f = mesh.faces[fi];
+            auto packed = [&](uint32_t k) {
+                const uint32_t corner = f.first + k % f.count, uvi = mesh.cornerUv[corner];
+                const Vec2d q = kept ? P.layoutUv[mi][corner] : Vec2d{};
+                const uint64_t key = kept ? ((uint64_t)std::bit_cast<uint32_t>((float)q.x) << 32) | std::bit_cast<uint32_t>((float)q.y)
+                                          : ((uint64_t)uvi << 32) | (uint32_t)isl;
+                auto [it, fresh] = index.try_emplace(key, (uint32_t)uv.size());
+                if (fresh) uv.push_back(kept ? q : P.new_uv(P.islands[isl], mesh.uvs[uvi], P.faceTile[mi][fi]));
+                return it->second;
+            };
+            for (uint32_t k = 0; k < f.count; ++k) {
+                const uint32_t a = packed(k), b = packed(k + 1);
+                if (a == b || !seen.insert(((uint64_t)std::min(a, b) << 32) | std::max(a, b)).second) continue;
+                preview.edges.push_back({(float)uv[a].x, (float)uv[a].y, (float)uv[b].x, (float)uv[b].y});
+            }
+        }
+        if (preview.edges.size() == first) continue;  // nothing of this object is packed
+        preview.objects.push_back(wide(mesh.name));
+        preview.objectFirst.push_back((uint32_t)first);
+    }
+    preview.objectFirst.push_back((uint32_t)preview.edges.size());
+    return true;
+}
+
+// ---- Auto detect: the maps from the objects' materials ------------------------------------------
+
+enum DetectRole { kRoleColor, kRoleNormal, kRoleRoughness, kRoleMetallic, kRoleOpacity, kRoleEmission, kRoleOcclusion, kRoles };
+const wchar_t* const kRoleName[kRoles] = {L"BaseColor", L"Normal", L"Roughness", L"Metallic", L"Opacity", L"Emission", L"Occlusion"};
+
+std::wstring lower(std::wstring s) {
+    for (wchar_t& c : s) c = (wchar_t)towlower(c);
+    return s;
+}
+
+bool has(const std::wstring& s, const wchar_t* key) { return s.find(key) != std::wstring::npos; }
+
+// The Normal Bump under a texmap, if any.
+Texmap* normal_bump(Texmap* tm, int depth = 0) {
+    if (!tm || depth > 8) return nullptr;
+    if (tm->ClassID() == GNORMAL_CLASS_ID) return tm;
+    for (int i = 0; i < tm->NumSubTexmaps(); ++i)
+        if (Texmap* nb = normal_bump(tm->GetSubTexmap(i), depth + 1)) return nb;
+    return nullptr;
+}
+
+// The role of a material's map slot, by its name (Physical, OpenPBR, USD Preview Surface,
+// Standard and the like); -1 for slots that are not packed (coat, specular, displacement, ...).
+int slot_role(const std::wstring& slot, Texmap* tm) {
+    const std::wstring s = lower(slot);
+    if (has(s, L"coat")) return -1;
+    if (has(s, L"normal") || (has(s, L"bump") && normal_bump(tm))) return kRoleNormal;
+    if (has(s, L"occlusion")) return kRoleOcclusion;
+    if (has(s, L"emissi")) return has(s, L"color") ? kRoleEmission : -1;
+    if (has(s, L"opacity") || has(s, L"cutout")) return kRoleOpacity;
+    if (has(s, L"metal")) return kRoleMetallic;
+    if (has(s, L"rough"))
+        return has(s, L"diffuse") || has(s, L"anisotropy") || has(s, L"transmission") || has(s, L"transparency") ? -1 : kRoleRoughness;
+    if (has(s, L"base color") || has(s, L"basecolor") || has(s, L"base_color") || has(s, L"albedo") || has(s, L"diffuse")) return kRoleColor;
+    return -1;
+}
+
+// The role a channel of the modifier is for, by its name; -1 for none (or no name).
+int channel_role(const std::wstring& name) {
+    const std::wstring s = lower(name);
+    if (s.empty()) return -1;
+    if (has(s, L"normal")) return kRoleNormal;
+    if (has(s, L"occlusion") || s == L"ao") return kRoleOcclusion;
+    if (has(s, L"emiss") || has(s, L"emit")) return kRoleEmission;
+    if (has(s, L"opac") || has(s, L"alpha") || has(s, L"cutout")) return kRoleOpacity;
+    if (has(s, L"metal")) return kRoleMetallic;
+    if (has(s, L"rough")) return kRoleRoughness;
+    if (has(s, L"color") || has(s, L"colour") || has(s, L"diffuse") || has(s, L"albedo") || has(s, L"base")) return kRoleColor;
+    return -1;
+}
+
+// The image files under a texmap, as Max's asset tracking finds them (any map type: Bitmap, OSL
+// bitmaps, ...), full paths where they resolve.
+std::vector<std::wstring> image_files(Texmap* tm) {
+    struct Files : AssetEnumCallback {
+        std::vector<std::wstring> list;
+        void RecordAsset(const MaxSDK::AssetManagement::AssetUser& a) override {
+            if (a.GetType() != MaxSDK::AssetManagement::kBitmapAsset) return;
+            MSTR full;
+            const std::wstring f = a.GetFullFilePath(full) ? full.data() : a.GetFileName().data();
+            if (!f.empty() && std::find(list.begin(), list.end(), f) == list.end()) list.push_back(f);
+        }
+    } files;
+    if (tm) tm->EnumAuxFiles(files, FILE_ENUM_ALL);
+    return files.list;
+}
+
+bool readable_image(const std::wstring& file) {
+    const std::wstring ext = lower(std::filesystem::path(file).extension().wstring());
+    return ext == L".png" || ext == L".jpg" || ext == L".jpeg" || ext == L".tga" || ext == L".bmp" || ext == L".psd";
+}
+
+// A material's packed maps: the file per role (empty: none), and notes on what was left.
+struct MaterialMaps {
+    std::wstring file[kRoles];
+    std::vector<std::string> notes;
+};
+
+MaterialMaps material_maps(Mtl* m) {
+    MaterialMaps out;
+    if (!m) return out;
+    bool any = false;
+    for (int i = 0; i < m->NumSubTexmaps(); ++i) {
+        Texmap* tm = m->GetSubTexmap(i);
+        if (!tm || !m->SubTexmapOn(i)) continue;
+        const std::wstring slot = m->GetSubTexmapSlotName(i, false).data();
+        const int role = slot_role(slot, tm);
+        if (role < 0 || !out.file[role].empty()) continue;
+        Texmap* nb = role == kRoleNormal ? normal_bump(tm) : nullptr;
+        std::vector<std::wstring> files = image_files(nb && nb->GetSubTexmap(0) ? nb->GetSubTexmap(0) : tm);
+        std::erase_if(files, [&](const std::wstring& f) {
+            if (readable_image(f)) return false;
+            out.notes.push_back(utf8(slot.c_str()) + ": " + utf8(std::filesystem::path(f).filename().wstring().c_str()) +
+                                " is not png, jpg, tga, bmp or psd");
+            return true;
+        });
+        if (files.empty()) continue;
+        if (files.size() > 1) out.notes.push_back(utf8(slot.c_str()) + ": " + std::to_string(files.size()) + " maps, took the first");
+        out.file[role] = files.front();
+        any = true;
+    }
+    // Shell and similar materials keep the maps in a sub-material.
+    if (!any && !m->IsMultiMtl())
+        for (int i = 0; i < m->NumSubMtls() && !any; ++i)
+            if (Mtl* sub = m->GetSubMtl(i)) {
+                MaterialMaps s = material_maps(sub);
+                for (int r = 0; r < kRoles; ++r) any |= !s.file[r].empty();
+                if (any) out = std::move(s);
+            }
+    return out;
+}
+
+// The sub-material faces of material ID `id` (0-based) show; materials that are not multi show
+// themselves. Multi/Sub-Object's GetSubMtl takes an ID of its ID list (stored 0-based) and IDs above
+// the largest wrap around (samples/materials/multi.cpp, FindSubMtlMod); other multi materials take
+// the ID modulo their count.
+Mtl* face_material(Mtl* m, int id) {
+    if (!m || !m->IsMultiMtl() || m->NumSubMtls() == 0) return m;
+    if (m->ClassID() == Class_ID(MULTI_CLASS_ID, 0))
+        if (IParamBlock2* pb = m->GetParamBlock(0)) {
+            const ParamID list = pb->IndextoID(pb->GetDesc()->NameToIndex(_M("materialIDList")));
+            if (list >= 0 && pb->Count(list) > 0) {
+                int top = 0;
+                for (int k = 0; k < pb->Count(list); ++k) top = std::max(top, pb->GetInt(list, 0, k));
+                return m->GetSubMtl(id > top ? id % (top + 1) : id);
+            }
+        }
+    return m->GetSubMtl(id % m->NumSubMtls());
+}
+
+bool pack_detect(Modifier* self, ExodusPackSettings& s, std::wstring& report) {
+    std::lock_guard guard(packLock);
+    Busy busy(self);
+    if (!busy.entered) {
+        report = L"busy";
+        return false;
+    }
+    const TimeValue t = GetCOREInterface()->GetTime();
+    // The objects: where the modifier sits (its input mesh), and the collapsed ones (their base object).
+    struct Target {
+        INode* node;
+        PackUse use;            // owner null: collapsed
+        ObjectState eval(TimeValue t) const {
+            if (use.owner) return use.index + 1 < use.owner->NumModifiers() ? use.owner->Eval(t, use.index + 1) : use.owner->GetObjRef()->Eval(t);
+            Object* base = node->GetObjectRef() ? node->GetObjectRef()->FindBaseObject() : nullptr;
+            return base ? base->Eval(t) : ObjectState();
+        }
+    };
+    std::vector<Target> targets;
+    const std::vector<PackUse> uses = uses_of(self);
+    for (const PackUse& u : uses) targets.push_back({u.node, u});
+    for (const std::wstring& name : s.collapsed) {
+        INode* n = GetCOREInterface()->GetINodeByName(name.c_str());
+        if (!n || std::any_of(uses.begin(), uses.end(), [&](const PackUse& u) { return u.node == n; })) continue;
+        targets.push_back({n, {n, nullptr, 0}});
+    }
+
+    std::string log;
+    std::vector<ExodusPackMap> found;  // the rows of the objects with maps
+    std::set<std::wstring> detected;
+    bool roles[kRoles] = {};
+    std::map<Mtl*, MaterialMaps> cache;
+    for (const Target& tg : targets) {
+        const std::wstring name = tg.node->GetName() ? tg.node->GetName() : L"";
+        const std::string uname = utf8(name.c_str());
+        Mtl* mtl = tg.node->GetMtl();
+        if (!mtl) {
+            log += "  ! " + uname + ": no material\n";
+            continue;
+        }
+        // Faces per (tile, material ID), tiles from the source UVs as the packer finds them.
+        std::map<std::pair<int, int>, int> faces;
+        std::string err;
+        const ObjectState os = tg.eval(t);
+        if (!os.obj || !os.obj->CanConvertToType(polyObjectClassID)) {
+            err = "not a mesh";
+        } else {
+            auto* po = static_cast<PolyObject*>(os.obj->ConvertToType(t, polyObjectClassID));
+            MNMesh& m = po->GetMesh();
+            MNMap* map = s.sourceChannel >= 1 && s.sourceChannel < m.MNum() ? m.M(s.sourceChannel) : nullptr;
+            if (!map || map->GetFlag(MN_DEAD) || map->FNum() != m.FNum()) err = "no UVs in map channel " + std::to_string(s.sourceChannel);
+            else
+                for (int f = 0; f < m.FNum(); ++f) {
+                    const MNFace* F = m.F(f);
+                    if (F->GetFlag(MN_DEAD) || map->F(f)->deg != F->deg) continue;
+                    double cu = 0, cv = 0;
+                    for (int k = 0; k < F->deg; ++k) {
+                        const int tv = map->F(f)->tv[k];
+                        if (tv >= 0 && tv < map->VNum()) cu += map->v[tv].x, cv += map->v[tv].y;
+                    }
+                    const Tile tile{(int)std::floor(cu / F->deg), (int)std::floor(cv / F->deg)};
+                    if (tile.u >= 0 && tile.u < 10 && tile.v >= 0 && tile.v < 100) ++faces[{udim_number(tile), (int)F->material}];
+                }
+            if (po != os.obj) po->MaybeAutoDelete();
+        }
+        if (!err.empty()) {
+            log += "  ! " + uname + ": " + err + "\n";
+            continue;
+        }
+        // Per tile and role, the file on the most faces (sub-materials of one tile may differ).
+        std::map<std::pair<int, int>, std::map<std::wstring, int>> votes;  // (tile, role) -> file -> faces
+        std::map<int, int> bare;  // per tile: faces whose (sub-)material has no maps
+        for (const auto& [key, n] : faces) {
+            Mtl* fm = face_material(mtl, key.second);
+            auto it = cache.find(fm);
+            if (it == cache.end()) {
+                it = cache.emplace(fm, material_maps(fm)).first;
+                for (const std::string& note : it->second.notes) log += "  ! " + uname + ", " + utf8(fm->GetName()) + ": " + note + "\n";
+            }
+            bool any = false;
+            for (int r = 0; r < kRoles; ++r)
+                if (!it->second.file[r].empty()) votes[{key.first, r}][it->second.file[r]] += n, any = true;
+            if (!any) bare[key.first] += n;
+        }
+        if (votes.empty()) {
+            log += "  ! " + uname + ": no maps in its material\n";
+            continue;
+        }
+        // A tile has one set of maps per object: faces there without maps get the others' maps.
+        for (const auto& [tile, n] : bare)
+            if (std::any_of(votes.begin(), votes.end(), [&](const auto& v) { return v.first.first == tile; }))
+                log += "  ! " + uname + ", tile " + std::to_string(tile) + ": " + std::to_string(n) +
+                       " faces show a material without maps; they get the maps of the other faces\n";
+        std::string line = "  " + uname + ":";
+        for (const auto& [key, files] : votes) {
+            auto best = std::max_element(files.begin(), files.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+            found.push_back({name, key.first, key.second, best->first});  // channel: the role for now
+            roles[key.second] = true;
+            line += " " + std::to_string(key.first) + " " + utf8(kRoleName[key.second]) + " " +
+                    utf8(std::filesystem::path(best->first).filename().wstring().c_str());
+            if (files.size() > 1)
+                log += "  ! " + uname + ", tile " + std::to_string(key.first) + ": " + std::to_string(files.size()) + " " +
+                       utf8(kRoleName[key.second]) + " maps (sub-materials), took the one on the most faces\n";
+        }
+        log += line + "\n";
+        detected.insert(name);
+    }
+
+    // Roles into channels: the channel named for it, else a free one named now.
+    int channelOf[kRoles];
+    std::string roleList;
+    for (int r = 0; r < kRoles; ++r) {
+        channelOf[r] = -1;
+        if (!roles[r]) continue;
+        for (int c = 0; c < kExodusPackChannels && channelOf[r] < 0; ++c)
+            if (channel_role(s.channel[c]) == r) channelOf[r] = c;
+        for (int c = 0; c < kExodusPackChannels && channelOf[r] < 0; ++c)
+            if (s.channel[c].empty()) {
+                s.channel[c] = kRoleName[r];
+                s.kind[c] = r == kRoleNormal ? 1 : 0;
+                channelOf[r] = c;
+                if (r == kRoleNormal) log += "  ! channel Normal added as Normal GL: set Normal DX if the maps are DirectX\n";
+            }
+        if (channelOf[r] < 0) log += "  ! no free channel for " + utf8(kRoleName[r]) + "\n";
+        else roleList += (roleList.empty() ? "" : ", ") + utf8(s.channel[channelOf[r]].c_str());
+    }
+    // The detected objects' rows replace their old ones; other rows stay.
+    std::erase_if(s.maps, [&](const ExodusPackMap& m) { return detected.count(m.object) > 0; });
+    for (ExodusPackMap& m : found)
+        if ((m.channel = channelOf[m.channel]) >= 0) s.maps.push_back(m);
+
+    char head[256];
+    std::snprintf(head, sizeof head, "auto detect: maps for %zu of %zu objects%s%s\n", detected.size(), targets.size(),
+                  roleList.empty() ? "" : " (", roleList.empty() ? "" : (roleList + ")").c_str());
+    report = wide(head + log);
+    return !detected.empty();
 }
 
 void pack_forget(Modifier* self) {
@@ -2022,7 +2411,7 @@ bool merge(const std::vector<INode*>& nodes, ExodusSink out, INode*& mergedOut) 
 }
 
 const ExodusCoreApi kApi{kExodusCoreApiVersion, kBuild, inspect, unsubdivide_modify, decimate_modify, write_weights,
-                       pack_modify, pack_bake, pack_forget, merge};
+                       pack_modify, pack_bake, pack_preview, pack_detect, pack_forget, merge};
 
 }  // namespace
 
